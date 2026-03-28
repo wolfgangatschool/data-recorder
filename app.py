@@ -324,6 +324,7 @@ for _k, _v in [("sensors", {}), ("live_buffers", {}),
 st.session_state.setdefault("recording", False)
 st.session_state.setdefault("sensor_counter", 0)
 st.session_state.setdefault("scan_state", {"in_progress": False, "last_time": 0.0, "results": []})
+st.session_state.setdefault("known_sensors", {})  # address → entry dict, persists across scans
 st.session_state.setdefault("live_discovery", True)
 
 _render_live_indicator()
@@ -362,7 +363,7 @@ def _sensor_display_label(entry: dict) -> str:
 
 # ── Background scan ────────────────────────────────────────────────────────────
 
-def _do_scan(scan_state: dict):
+def _do_scan(scan_state: dict, known_sensors: dict):
     """Background thread: discover all available PASCO sensors."""
     global _scan_device_ref
     with _ble_lock:
@@ -375,6 +376,9 @@ def _do_scan(scan_state: dict):
     scan_state["results"]     = [_parse_ble_device(d) for d in found]
     scan_state["in_progress"] = False
     scan_state["last_time"]   = time.time()
+    # Merge into known_sensors so newly discovered devices are available immediately.
+    for entry in scan_state["results"]:
+        known_sensors[entry["address"]] = entry
 
 
 def _start_scan():
@@ -383,7 +387,9 @@ def _start_scan():
         return
     st.session_state.scan_state["in_progress"] = True
     threading.Thread(
-        target=_do_scan, args=(st.session_state.scan_state,), daemon=True
+        target=_do_scan,
+        args=(st.session_state.scan_state, st.session_state.known_sensors),
+        daemon=True,
     ).start()
 
 
@@ -466,6 +472,7 @@ def _connect_thread_fn(entry: dict, key: str, sensor_info: dict, live_buffers: d
 
 def _start_connect(entry: dict):
     """Create a sensor entry and start a connection thread for a discovered device."""
+    st.session_state.known_sensors[entry["address"]] = entry
     st.session_state.sensor_counter += 1
     key = f"sensor_{entry['address']}_{st.session_state.sensor_counter}"
     sensor_info = {
@@ -586,22 +593,26 @@ if PASCO_AVAILABLE:
         for info in st.session_state.sensors.values()
         if "address" in info
     }
-    available = [s for s in scan_state["results"] if s["address"] not in connected_addrs]
+    available = [s for s in st.session_state.known_sensors.values() if s["address"] not in connected_addrs]
 
     col_sel, col_add = st.sidebar.columns([3, 1])
     if available:
-        # Clamp stored index when the list shrank or the value is stale/wrong type.
-        _cur = st.session_state.get("sel_sensor_idx", 0)
-        if not isinstance(_cur, int) or _cur >= len(available):
-            st.session_state["sel_sensor_idx"] = 0
+        # Track selection by address so the displayed item always matches the list.
+        _saved_addr = st.session_state.get("sel_sensor_addr")
+        _avail_addrs = [s["address"] for s in available]
+        if _saved_addr not in _avail_addrs:
+            st.session_state["sel_sensor_addr"] = _avail_addrs[0]
+            _saved_addr = _avail_addrs[0]
+        _cur_idx = _avail_addrs.index(_saved_addr)
 
         new_idx = col_sel.selectbox(
             "Sensor",
             options=range(len(available)),
+            index=_cur_idx,
             format_func=lambda i: _sensor_display_label(available[i]),
             label_visibility="collapsed",
-            key="sel_sensor_idx",
         )
+        st.session_state["sel_sensor_addr"] = available[new_idx]["address"]
 
         if col_add.button("＋", key="btn_connect", width="stretch",
                           help="Connect selected sensor"):
