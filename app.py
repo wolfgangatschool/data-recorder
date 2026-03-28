@@ -13,7 +13,93 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 try:
+    import asyncio as _asyncio
+    import asyncio.events as _asyncio_events
+    import asyncio.tasks as _asyncio_tasks
+    from bleak import BleakClient
+    from bleak.backends.corebluetooth.CentralManagerDelegate import CentralManagerDelegate
     from pasco.pasco_ble_device import PASCOBLEDevice
+
+    # nest_asyncio forces _PyTask (Python impl) which updates _current_tasks dict,
+    # but asyncio.current_task() is the C implementation that uses C-level tracking
+    # and never sees _PyTask entries — returns None inside every pasco coroutine.
+    # asyncio.timeout() and asyncio.TaskGroup() both require current_task() != None.
+    # Fix: replace current_task() with a version that falls back to the Python dict.
+    # Guard with a sentinel so Streamlit reruns don't stack wrapper upon wrapper.
+    if not getattr(_asyncio.current_task, "_pasco_patched", False):
+        _c_current_task = _asyncio.current_task
+        def _patched_current_task(loop=None):
+            task = _c_current_task(loop)
+            if task is not None:
+                return task
+            running = _asyncio_events._get_running_loop()
+            if running is None:
+                return None
+            return _asyncio_tasks._current_tasks.get(running)
+        _patched_current_task._pasco_patched = True
+        _asyncio.current_task = _patched_current_task
+        _asyncio.tasks.current_task = _patched_current_task
+
+    # nest_asyncio breaks asyncio.current_task() — it returns None even inside a
+    # Task, which causes asyncio.timeout() (used in CentralManagerDelegate.connect)
+    # to raise "Timeout should be used inside a task".
+    # Fix: replace async_timeout with loop.call_later, which never needs current_task.
+    async def _cmd_connect_patched(self, peripheral, disconnect_callback, timeout=10.0):
+        self._disconnect_callbacks[peripheral.identifier()] = disconnect_callback
+        future = self.event_loop.create_future()
+        self._connect_futures[peripheral.identifier()] = future
+        # Schedule cancellation via call_later — no asyncio.timeout needed.
+        _handle = self.event_loop.call_later(
+            timeout,
+            lambda: future.cancel() if not future.done() else None,
+        )
+        try:
+            self.central_manager.connectPeripheral_options_(peripheral, None)
+            try:
+                await future
+            except _asyncio.CancelledError:
+                raise _asyncio.TimeoutError()
+        except _asyncio.TimeoutError:
+            del self._connect_futures[peripheral.identifier()]
+            disc_future = self.event_loop.create_future()
+            self._disconnect_futures[peripheral.identifier()] = disc_future
+            try:
+                self.central_manager.cancelPeripheralConnection_(peripheral)
+                await disc_future
+            finally:
+                del self._disconnect_futures[peripheral.identifier()]
+            del self._disconnect_callbacks[peripheral.identifier()]
+            raise
+        finally:
+            _handle.cancel()
+            self._connect_futures.pop(peripheral.identifier(), None)
+
+    CentralManagerDelegate.connect = _cmd_connect_patched
+
+    # Pasco's connect() passes only ble_device.address to BleakClient, discarding
+    # the CBPeripheral. Pass the full BLEDevice so BleakClient gets the CBPeripheral
+    # from the scan that already ran (same CBCentralManager instance).
+    def _pasco_connect_patched(self, ble_device):
+        if ble_device is None:
+            raise self.InvalidParameter
+        if self._client is not None:
+            raise self.BLEAlreadyConnectedError("Device already connected")
+        self._client = BleakClient(ble_device)
+        try:
+            self._loop.run_until_complete(self._async_connect())
+        except Exception as _e:
+            raise self.BLEConnectionError(f"Could not connect: {_e}")
+        self._set_device_params(ble_device)
+        if self._dev_type == "Rotary Motion":
+            self._loop.run_until_complete(
+                self.write_await_callback(self.SENSOR_SERVICE_ID, self.WIRELESS_RMS_START)
+            )
+        try:
+            self.initialize_device()
+        except Exception as _e:
+            raise self.BLEConnectionError(f"initialize_device failed: {_e}")
+
+    PASCOBLEDevice.connect = _pasco_connect_patched
     PASCO_AVAILABLE = True
 except ImportError:
     PASCO_AVAILABLE = False
@@ -357,18 +443,21 @@ def _stream_sensor(device, key: str, sensor_info: dict, live_buffers: dict):
 
 def _connect_thread_fn(entry: dict, key: str, sensor_info: dict, live_buffers: dict):
     """
-    Connect using the BLEDevice already stored in the scan results.
-    pasco.connect() only uses ble_device.address (a string UUID), so the
-    CBPeripheral inside the BLEDevice object does not need to be fresh.
-    Avoids spawning extra CBCentralManager instances (one from BleakScanner
-    inside scan() + one from BleakClient inside connect()) that interfere
-    on macOS CoreBluetooth.
+    Scan and connect on the same PASCOBLEDevice so that the CBCentralManager
+    and event loop are shared between scan and connect.  The CentralManagerDelegate
+    captures the running loop at scan time; connecting on a different loop causes
+    asyncio.timeout to fail with "Timeout should be used inside a task".
     """
     sensor_info["status"] = "connecting…"
     with _ble_lock:
         device = PASCOBLEDevice()
         try:
-            device.connect(entry["ble_device"])
+            found = device.scan() or []
+            match = next((d for d in found if d.address == entry["address"]), None)
+            if match is None:
+                sensor_info["status"] = "error: sensor not found (out of range?)"
+                return
+            device.connect(match)
         except Exception as exc:
             sensor_info["status"] = f"error: {exc}"
             return
@@ -491,13 +580,11 @@ if PASCO_AVAILABLE:
             _start_scan()
             st.rerun()
 
-    # Available sensors dropdown — exclude already-connected ones
+    # Available sensors dropdown — exclude any sensor already added (regardless of status)
     connected_addrs = {
         info["address"]
         for info in st.session_state.sensors.values()
         if "address" in info
-        and "error" not in info.get("status", "")
-        and info.get("status") != "disconnected"
     }
     available = [s for s in scan_state["results"] if s["address"] not in connected_addrs]
 
