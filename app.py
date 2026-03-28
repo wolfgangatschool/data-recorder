@@ -46,6 +46,18 @@ except ImportError:
 # Recording helpers are always available (no BLE dependency).
 from recording import _start_recording, _stop_recording, _flush_live_to_record, _download_csv
 
+# Inline SVG of the Bluetooth logo — the canonical symbol made from its two paths:
+# a vertical stroke and the two right-pointing V-bumps that form the B shape.
+# Used in sidebar markdown (unsafe_allow_html=True); the selectbox dropdown uses
+# the plain-text ᛒ in _sensor_display_label since it only accepts a string.
+_BT_SVG = (
+    '<svg width="9" height="13" viewBox="0 0 10 16" fill="none" '
+    'style="vertical-align:-2px;display:inline">'
+    '<path d="M5 0 L5 16 M5 0 L9 4 L5 8 L9 12 L5 16" '
+    'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>'
+    '</svg>'
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Page configuration
@@ -289,6 +301,22 @@ _render_live_indicator()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: CSV file upload  (shown first)
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.sidebar.markdown('<p class="sidebar-section">Load recorded data</p>', unsafe_allow_html=True)
+uploaded = st.sidebar.file_uploader("Load CSV", type="csv", label_visibility="collapsed")
+
+
+@st.cache_data
+def _load_csv(source) -> pd.DataFrame:
+    return pd.read_csv(source, low_memory=False)
+
+
+raw = _load_csv(uploaded) if uploaded else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Sidebar: live sensor controls
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -373,36 +401,16 @@ if PASCO_AVAILABLE:
             icon   = ("🟢" if status == "connected" else
                       "🔴" if "error" in status else "🟡")
             col_lbl, col_m = st.sidebar.columns([3, 1])
-            lines = [
-                f"{icon} **{info.get('quantity', '?')}**",
-                info.get("model", ""),
-                f"`{info.get('sensor_id', '')}`",
-            ]
+            label = f"{icon} **{info.get('quantity', '?')}** {_BT_SVG} {info.get('sensor_id', '')}"
             if status not in ("connected",):
-                lines.append(f"*{status}*")
-            col_lbl.markdown("  \n".join(lines))
+                label += f"  \n*{status}*"
+            col_lbl.markdown(label, unsafe_allow_html=True)
             if col_m.button("－", key=f"disc_{key}", help="Disconnect", width="stretch"):
                 _disconnect_sensor(key)
                 st.rerun()
 
 else:
     st.sidebar.caption("Install `pasco` to enable live sensors.")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar: CSV file upload
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.sidebar.markdown('<p class="sidebar-section">Load recorded data</p>', unsafe_allow_html=True)
-uploaded = st.sidebar.file_uploader("Load CSV", type="csv", label_visibility="collapsed")
-
-
-@st.cache_data
-def _load_csv(source) -> pd.DataFrame:
-    return pd.read_csv(source, low_memory=False)
-
-
-raw = _load_csv(uploaded) if uploaded else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

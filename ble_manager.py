@@ -44,12 +44,24 @@ def _parse_ble_device(ble_device) -> dict:
 
     Returns a dict with keys: quantity, model, sensor_id, address, ble_device.
     """
-    name    = (ble_device.name or "").strip()
+    # Strip everything from ">" onward (some sensors append extra info after ">").
+    name    = (ble_device.name or "").split(">")[0].strip()
     address = ble_device.address or ""
     parts   = name.split()
-    quantity  = parts[0] if parts else "Sensor"
-    model     = parts[1] if len(parts) >= 2 else "—"
-    sensor_id = parts[2] if len(parts) >= 3 else address.replace("-", "")[-6:].upper()
+    quantity = parts[0] if parts else "Sensor"
+    if len(parts) >= 3:
+        # e.g. "Voltage PS-3211 390900" → model="PS-3211", serial="390900"
+        model  = parts[1]
+        raw_id = parts[2]
+    elif len(parts) == 2:
+        # e.g. "Voltage 390-900" (after > strip) → serial is parts[1]
+        model  = "—"
+        raw_id = parts[1]
+    else:
+        model  = "—"
+        raw_id = address.replace("-", "")[-6:].upper()
+    # Insert dash only when not already present (e.g. "390900" → "390-900").
+    sensor_id = f"{raw_id[:3]}-{raw_id[3:]}" if len(raw_id) > 3 and "-" not in raw_id else raw_id
     return {
         "quantity":   quantity,
         "model":      model,
@@ -61,7 +73,7 @@ def _parse_ble_device(ble_device) -> dict:
 
 def _sensor_display_label(entry: dict) -> str:
     """Format a parsed sensor entry as a human-readable dropdown label."""
-    return f"{entry['quantity']}  {entry['model']}  {entry['sensor_id']}"
+    return f"{entry['quantity']} ᛒ {entry['sensor_id']}"
 
 
 # ── Background scan ────────────────────────────────────────────────────────────
