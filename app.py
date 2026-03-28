@@ -1,10 +1,26 @@
+"""
+Physics Data Recorder — main Streamlit application.
+
+Layout
+------
+  Toolbar (fixed):  title | Live Discovery badge | Download CSV button
+  Sidebar:          live sensor controls | CSV file upload | series visibility
+  Main area:        time-series plot (one subplot per unit) | Record/Stop bar
+
+Live sensor flow
+----------------
+  1. Background scan discovers PASCO BLE sensors (ble_manager._do_scan).
+  2. User picks a sensor from the dropdown and clicks ＋.
+  3. A background thread scans again, connects, and streams data into a ring
+     buffer (ble_manager._connect_thread_fn → _stream_sensor).
+  4. The plot is rebuilt and _flush_live_to_record copies new points into the
+     recording buffer on every Streamlit rerun.
+  5. User clicks Record / Stop to bracket a session, then downloads a CSV.
+"""
+
 import base64
-import math
 import re
-import threading
 import time
-from collections import deque
-from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -12,101 +28,30 @@ from plotly.subplots import make_subplots
 import streamlit as st
 import streamlit.components.v1 as components
 
+# ── BLE patches and management (optional — disabled if bleak/pasco not installed) ──
 try:
-    import asyncio as _asyncio
-    import asyncio.events as _asyncio_events
-    import asyncio.tasks as _asyncio_tasks
-    from bleak import BleakClient
-    from bleak.backends.corebluetooth.CentralManagerDelegate import CentralManagerDelegate
-    from pasco.pasco_ble_device import PASCOBLEDevice
-
-    # nest_asyncio forces _PyTask (Python impl) which updates _current_tasks dict,
-    # but asyncio.current_task() is the C implementation that uses C-level tracking
-    # and never sees _PyTask entries — returns None inside every pasco coroutine.
-    # asyncio.timeout() and asyncio.TaskGroup() both require current_task() != None.
-    # Fix: replace current_task() with a version that falls back to the Python dict.
-    # Guard with a sentinel so Streamlit reruns don't stack wrapper upon wrapper.
-    if not getattr(_asyncio.current_task, "_pasco_patched", False):
-        _c_current_task = _asyncio.current_task
-        def _patched_current_task(loop=None):
-            task = _c_current_task(loop)
-            if task is not None:
-                return task
-            running = _asyncio_events._get_running_loop()
-            if running is None:
-                return None
-            return _asyncio_tasks._current_tasks.get(running)
-        _patched_current_task._pasco_patched = True
-        _asyncio.current_task = _patched_current_task
-        _asyncio.tasks.current_task = _patched_current_task
-
-    # nest_asyncio breaks asyncio.current_task() — it returns None even inside a
-    # Task, which causes asyncio.timeout() (used in CentralManagerDelegate.connect)
-    # to raise "Timeout should be used inside a task".
-    # Fix: replace async_timeout with loop.call_later, which never needs current_task.
-    async def _cmd_connect_patched(self, peripheral, disconnect_callback, timeout=10.0):
-        self._disconnect_callbacks[peripheral.identifier()] = disconnect_callback
-        future = self.event_loop.create_future()
-        self._connect_futures[peripheral.identifier()] = future
-        # Schedule cancellation via call_later — no asyncio.timeout needed.
-        _handle = self.event_loop.call_later(
-            timeout,
-            lambda: future.cancel() if not future.done() else None,
-        )
-        try:
-            self.central_manager.connectPeripheral_options_(peripheral, None)
-            try:
-                await future
-            except _asyncio.CancelledError:
-                raise _asyncio.TimeoutError()
-        except _asyncio.TimeoutError:
-            del self._connect_futures[peripheral.identifier()]
-            disc_future = self.event_loop.create_future()
-            self._disconnect_futures[peripheral.identifier()] = disc_future
-            try:
-                self.central_manager.cancelPeripheralConnection_(peripheral)
-                await disc_future
-            finally:
-                del self._disconnect_futures[peripheral.identifier()]
-            del self._disconnect_callbacks[peripheral.identifier()]
-            raise
-        finally:
-            _handle.cancel()
-            self._connect_futures.pop(peripheral.identifier(), None)
-
-    CentralManagerDelegate.connect = _cmd_connect_patched
-
-    # Pasco's connect() passes only ble_device.address to BleakClient, discarding
-    # the CBPeripheral. Pass the full BLEDevice so BleakClient gets the CBPeripheral
-    # from the scan that already ran (same CBCentralManager instance).
-    def _pasco_connect_patched(self, ble_device):
-        if ble_device is None:
-            raise self.InvalidParameter
-        if self._client is not None:
-            raise self.BLEAlreadyConnectedError("Device already connected")
-        self._client = BleakClient(ble_device)
-        try:
-            self._loop.run_until_complete(self._async_connect())
-        except Exception as _e:
-            raise self.BLEConnectionError(f"Could not connect: {_e}")
-        self._set_device_params(ble_device)
-        if self._dev_type == "Rotary Motion":
-            self._loop.run_until_complete(
-                self.write_await_callback(self.SENSOR_SERVICE_ID, self.WIRELESS_RMS_START)
-            )
-        try:
-            self.initialize_device()
-        except Exception as _e:
-            raise self.BLEConnectionError(f"initialize_device failed: {_e}")
-
-    PASCOBLEDevice.connect = _pasco_connect_patched
+    # ble_patches applies asyncio/pasco compatibility fixes on import (side-effects only).
+    import ble_patches  # noqa: F401
+    from ble_manager import (
+        SCAN_INTERVAL_S,
+        _sensor_display_label,
+        _start_scan,
+        _start_connect,
+        _disconnect_sensor,
+    )
     PASCO_AVAILABLE = True
 except ImportError:
     PASCO_AVAILABLE = False
 
-st.set_page_config(page_title="Time Series Viewer", layout="wide")
+# Recording helpers are always available (no BLE dependency).
+from recording import _start_recording, _stop_recording, _flush_live_to_record, _download_csv
 
-# ── Global style ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Page configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="Time Series Viewer", layout="wide")
 
 st.markdown("""
 <style>
@@ -149,8 +94,8 @@ h1 {
     margin-bottom: -0.3rem;
 }
 
-/* Precisely hide the live_discovery toggle by its Streamlit key class.
-   visibility:hidden (not display:none) keeps it in the DOM so JS can click it. */
+/* Hide the live_discovery toggle visually but keep it in the DOM so JS can
+   click it.  visibility:hidden (not display:none) preserves the element. */
 .st-key-live_discovery {
     visibility: hidden !important;
     position: absolute !important;
@@ -159,7 +104,7 @@ h1 {
     padding: 0 !important;
     margin: 0 !important;
 }
-/* Collapse layout space for the key container and the JS iframe */
+/* Collapse layout space for the hidden toggle and the JS injection iframe */
 [data-testid="element-container"]:has(.st-key-live_discovery),
 [data-testid="element-container"]:has(iframe) {
     height: 0 !important;
@@ -181,7 +126,7 @@ h1 {
 /* Hide Streamlit's native running spinner and stop button */
 [data-testid="stStatusWidget"] { display: none !important; }
 
-/* Download link — below the live discovery badge */
+/* Toolbar: Download CSV link */
 .toolbar-dl {
     position: fixed;
     top: 2.875rem;
@@ -206,7 +151,7 @@ h1 {
     background: rgba(128,128,128,0.07);
 }
 
-/* Live sensor discovery button in the toolbar */
+/* Toolbar: Live Discovery badge */
 .toolbar-live {
     position: fixed;
     top: 0;
@@ -257,12 +202,23 @@ h1 {
 st.title("Time Series Viewer")
 
 
-# ── Toolbar: live discovery indicator (rendered early — visible even before st.stop) ──
-def _render_live_indicator():
-    _live = st.session_state.get("live_discovery", True)
+# ─────────────────────────────────────────────────────────────────────────────
+# Toolbar: Live Discovery badge
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _render_live_indicator() -> None:
+    """
+    Render the fixed-position Live Discovery badge in the toolbar.
+
+    The badge is a styled HTML element.  A hidden Streamlit toggle holds the
+    boolean state, and a small JS snippet wires a click on the badge to a
+    programmatic click on the toggle — this is the only reliable way to update
+    Streamlit state from an arbitrary DOM element without a form submission.
+    """
+    _live     = st.session_state.get("live_discovery", True)
     _scanning = PASCO_AVAILABLE and st.session_state.get("scan_state", {}).get("in_progress", False)
-    _cls  = ("on" + (" scanning" if _scanning else "")) if _live else "off"
-    _wifi = (
+    _cls      = ("on" + (" scanning" if _scanning else "")) if _live else "off"
+    _wifi_svg = (
         '<svg width="15" height="13" viewBox="0 0 20 16" fill="none" '
         'stroke="currentColor" stroke-width="2.2" stroke-linecap="round">'
         '<path class="arc a3" d="M1 7 Q10 0 19 7"/>'
@@ -274,19 +230,17 @@ def _render_live_indicator():
     _label = "Live Discovery" if _live else "Discovery off"
     st.markdown(
         f'<div class="toolbar-live {_cls}" id="tlc">'
-        f'<div class="toolbar-live-badge">{_wifi}&nbsp;{_label}</div>'
+        f'<div class="toolbar-live-badge">{_wifi_svg}&nbsp;{_label}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
     if PASCO_AVAILABLE:
-        # Hidden toggle — Streamlit manages the boolean state.
+        # Hidden toggle that Streamlit uses to manage the live_discovery boolean.
         st.toggle("Live sensor discovery", key="live_discovery",
                   label_visibility="collapsed")
-        # Wire badge click → toggle state.
-        # Key insight: calling .click() from inside an iframe doesn't trigger
-        # React's event system in the parent. Fix: inject a <script> tag directly
-        # into the parent document — it executes in the parent window's JS context,
-        # where React's synthetic events work normally.
+        # Wire badge click → toggle click via a <script> injected into the
+        # parent document.  A plain iframe script cannot trigger React's
+        # synthetic events in the parent; injecting into document.head can.
         components.html("""<script>
 (function(){
   var d = window.parent.document;
@@ -310,260 +264,39 @@ def _render_live_indicator():
 </script>""", height=0)
 
 
-# ── Session state ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Session state initialisation
+# ─────────────────────────────────────────────────────────────────────────────
 
-# sensors:       {key: {status, label, unit, meas_name, stop_event, thread, ...}}
-# live_buffers:  {unit: {key: deque[(t_sec, value)]}}
-# recording:     bool
-# record_data:   {unit: {sensor_key: list[(t, v)]}}
-# record_last_t: {(unit, key): float}  — last t value copied into record_data
-# scan_state:    {in_progress, last_time, results: [parsed-device-dicts]}
-for _k, _v in [("sensors", {}), ("live_buffers", {}),
-               ("record_data", {}), ("record_last_t", {})]:
-    st.session_state.setdefault(_k, _v)
-st.session_state.setdefault("recording", False)
+# sensors:       {key: {status, label, unit, meas_name, stop_event, thread, …}}
+# live_buffers:  {unit: {sensor_key: deque[(elapsed_s, value)]}}
+# record_data:   {unit: {sensor_key: [(t, v), …]}}
+# record_last_t: {(unit, sensor_key): float}  — watermark for flush
+# scan_state:    {in_progress: bool, last_time: float, results: [parsed-device-dict]}
+# known_sensors: {address: parsed-device-dict}  — persists across scans
+
+st.session_state.setdefault("sensors",       {})
+st.session_state.setdefault("live_buffers",  {})
+st.session_state.setdefault("record_data",   {})
+st.session_state.setdefault("record_last_t", {})
+st.session_state.setdefault("recording",     False)
 st.session_state.setdefault("sensor_counter", 0)
-st.session_state.setdefault("scan_state", {"in_progress": False, "last_time": 0.0, "results": []})
-st.session_state.setdefault("known_sensors", {})  # address → entry dict, persists across scans
+st.session_state.setdefault("scan_state",    {"in_progress": False, "last_time": 0.0, "results": []})
+st.session_state.setdefault("known_sensors", {})  # address → entry; populated by scans
 st.session_state.setdefault("live_discovery", True)
 
 _render_live_indicator()
 
-# ── Live sensor helpers ────────────────────────────────────────────────────────
 
-# BLE operations are serialised — only one CBCentralManager at a time on macOS.
-_ble_lock = threading.Lock()
-# Keep a strong reference to the last scan device so its CoreBluetooth delegate
-# is not garbage-collected while CoreBluetooth's background thread is still
-# delivering discovery callbacks (prevents the PyObjC crash on Ctrl-C).
-_scan_device_ref = None
-
-SCAN_INTERVAL_S = 15  # seconds between automatic background scans
-
-
-def _parse_ble_device(ble_device) -> dict:
-    """
-    Extract structured metadata from a discovered BLEDevice.
-    Pasco names follow the pattern "Quantity Model Serial", e.g. "Voltage PS-3211 123456".
-    Missing tokens fall back gracefully.
-    """
-    name    = (ble_device.name or "").strip()
-    address = ble_device.address or ""
-    parts   = name.split()
-    quantity  = parts[0] if parts else "Sensor"
-    model     = parts[1] if len(parts) >= 2 else "—"
-    sensor_id = parts[2] if len(parts) >= 3 else address.replace("-", "")[-6:].upper()
-    return {"quantity": quantity, "model": model, "sensor_id": sensor_id,
-            "address": address, "ble_device": ble_device}
-
-
-def _sensor_display_label(entry: dict) -> str:
-    return f"{entry['quantity']}  {entry['model']}  {entry['sensor_id']}"
-
-
-# ── Background scan ────────────────────────────────────────────────────────────
-
-def _do_scan(scan_state: dict, known_sensors: dict):
-    """Background thread: discover all available PASCO sensors."""
-    global _scan_device_ref
-    with _ble_lock:
-        try:
-            device = PASCOBLEDevice()
-            _scan_device_ref = device  # prevent GC; keeps CoreBluetooth delegate alive
-            found  = device.scan() or []
-        except Exception:
-            found = []
-    scan_state["results"]     = [_parse_ble_device(d) for d in found]
-    scan_state["in_progress"] = False
-    scan_state["last_time"]   = time.time()
-    # Merge into known_sensors so newly discovered devices are available immediately.
-    for entry in scan_state["results"]:
-        known_sensors[entry["address"]] = entry
-
-
-def _start_scan():
-    """Kick off a background scan if one is not already running."""
-    if st.session_state.scan_state["in_progress"]:
-        return
-    st.session_state.scan_state["in_progress"] = True
-    threading.Thread(
-        target=_do_scan,
-        args=(st.session_state.scan_state, st.session_state.known_sensors),
-        daemon=True,
-    ).start()
-
-
-# ── Stream / connect ───────────────────────────────────────────────────────────
-
-def _stream_sensor(device, key: str, sensor_info: dict, live_buffers: dict):
-    """Poll one connected PASCOBLEDevice until stop_event is set."""
-    try:
-        meas_list = device.get_measurement_list()
-        if not meas_list:
-            sensor_info["status"] = "error: no measurements found"
-            device.disconnect()
-            return
-        meas_name = meas_list[0]
-
-        unit = None
-        for ch_measurements in device._device_measurements.values():
-            for m_attrs in ch_measurements.values():
-                if m_attrs.get("NameTag") == meas_name:
-                    unit = m_attrs.get("Units", "")
-                    break
-            if unit is not None:
-                break
-        if not unit:
-            unit = "V" if "voltage" in meas_name.lower() else \
-                   "A" if "current" in meas_name.lower() else meas_name
-    except Exception as exc:
-        sensor_info["status"] = f"error: {exc}"
-        try:
-            device.disconnect()
-        except Exception:
-            pass
-        return
-
-    live_buffers.setdefault(unit, {})
-    live_buffers[unit][key] = deque(maxlen=20_000)
-    buf = live_buffers[unit][key]
-    sensor_info.update({"status": "connected", "unit": unit, "meas_name": meas_name})
-
-    stop_event = sensor_info["stop_event"]
-    t0 = time.time()
-    while not stop_event.is_set():
-        try:
-            val = device.read_data(meas_name)
-            if val is not None:
-                buf.append((time.time() - t0, float(val)))
-        except Exception:
-            break
-        time.sleep(0.05)
-
-    try:
-        device.disconnect()
-    except Exception:
-        pass
-    sensor_info["status"] = "disconnected"
-
-
-def _connect_thread_fn(entry: dict, key: str, sensor_info: dict, live_buffers: dict):
-    """
-    Scan and connect on the same PASCOBLEDevice so that the CBCentralManager
-    and event loop are shared between scan and connect.  The CentralManagerDelegate
-    captures the running loop at scan time; connecting on a different loop causes
-    asyncio.timeout to fail with "Timeout should be used inside a task".
-    """
-    sensor_info["status"] = "connecting…"
-    with _ble_lock:
-        device = PASCOBLEDevice()
-        try:
-            found = device.scan() or []
-            match = next((d for d in found if d.address == entry["address"]), None)
-            if match is None:
-                sensor_info["status"] = "error: sensor not found (out of range?)"
-                return
-            device.connect(match)
-        except Exception as exc:
-            sensor_info["status"] = f"error: {exc}"
-            return
-    _stream_sensor(device, key, sensor_info, live_buffers)
-
-
-def _start_connect(entry: dict):
-    """Create a sensor entry and start a connection thread for a discovered device."""
-    st.session_state.known_sensors[entry["address"]] = entry
-    st.session_state.sensor_counter += 1
-    key = f"sensor_{entry['address']}_{st.session_state.sensor_counter}"
-    sensor_info = {
-        "address":    entry["address"],
-        "quantity":   entry["quantity"],
-        "model":      entry["model"],
-        "sensor_id":  entry["sensor_id"],
-        "status":     "starting…",
-        "label":      entry["quantity"],
-        "unit":       None,
-        "meas_name":  None,
-        "stop_event": threading.Event(),
-        "thread":     None,
-    }
-    st.session_state.sensors[key] = sensor_info
-    t = threading.Thread(
-        target=_connect_thread_fn,
-        args=(entry, key, sensor_info, st.session_state.live_buffers),
-        daemon=True,
-    )
-    sensor_info["thread"] = t
-    t.start()
-
-
-def _disconnect_sensor(key: str):
-    info = st.session_state.sensors.get(key)
-    if info:
-        info["stop_event"].set()
-    unit = (info or {}).get("unit")
-    if unit and key in st.session_state.live_buffers.get(unit, {}):
-        del st.session_state.live_buffers[unit][key]
-    if key in st.session_state.sensors:
-        del st.session_state.sensors[key]
-
-
-# ── Recording helpers ──────────────────────────────────────────────────────────
-
-def _start_recording():
-    st.session_state.recording = True
-    st.session_state.record_data = {}
-    # Initialise record_last_t to the current buffer tail for every already-connected
-    # sensor so that only data arriving *after* Record is pressed gets captured.
-    # Sensors added later start from t=-1 (i.e. include all their data, which begins
-    # at or after the moment they were connected post-Record).
-    record_last_t = {}
-    for unit, addr_bufs in st.session_state.live_buffers.items():
-        for addr, buf in addr_bufs.items():
-            if buf:
-                record_last_t[(unit, addr)] = list(buf)[-1][0]
-    st.session_state.record_last_t = record_last_t
-
-
-def _stop_recording():
-    st.session_state.recording = False
-
-
-def _flush_live_to_record():
-    """Copy new live points into record_data for all units."""
-    if not st.session_state.recording:
-        return
-    for unit, addr_bufs in st.session_state.live_buffers.items():
-        for addr, buf in addr_bufs.items():
-            pts = list(buf)
-            last_t = st.session_state.record_last_t.get((unit, addr), -1.0)
-            new_pts = [(t, v) for t, v in pts if t > last_t]
-            if new_pts:
-                st.session_state.record_data.setdefault(unit, {}).setdefault(addr, []).extend(new_pts)
-                st.session_state.record_last_t[(unit, addr)] = new_pts[-1][0]
-
-
-def _download_csv() -> bytes:
-    """Build a CSV with all recorded units/sensors."""
-    rows = []
-    for unit, addr_map in st.session_state.record_data.items():
-        for addr, pts in addr_map.items():
-            sensor_info = st.session_state.sensors.get(addr, {})
-            label = sensor_info.get("label", addr)
-            for t, v in pts:
-                rows.append({"sensor": label, "time_s": t, "value": v, "unit": unit})
-    if not rows:
-        return b"sensor,time_s,value,unit\n"
-    return pd.DataFrame(rows).to_csv(index=False).encode()
-
-
-# ── Sidebar: live sensors ─────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: live sensor controls
+# ─────────────────────────────────────────────────────────────────────────────
 
 if PASCO_AVAILABLE:
     scan_state = st.session_state.scan_state
-    _live = st.session_state.live_discovery
+    _live      = st.session_state.live_discovery
 
-    # Auto-scan on first load and every SCAN_INTERVAL_S seconds (only when live discovery on)
+    # Auto-scan on first load and every SCAN_INTERVAL_S seconds when live discovery is on.
     if _live and not scan_state["in_progress"] and (
         scan_state["last_time"] == 0.0
         or time.time() - scan_state["last_time"] >= SCAN_INTERVAL_S
@@ -572,33 +305,37 @@ if PASCO_AVAILABLE:
 
     st.sidebar.markdown('<p class="sidebar-section">Live sensors</p>', unsafe_allow_html=True)
 
+    # Scan status caption + manual refresh button
     col_cap, col_ref = st.sidebar.columns([3, 1])
     with col_cap:
         if scan_state["last_time"] > 0:
             ts = time.strftime("%H:%M:%S", time.localtime(scan_state["last_time"]))
-            st.caption(f"Last update at {ts}")
+            st.caption(f"Last scan at {ts}")
         elif scan_state["in_progress"]:
             st.caption("Scanning…")
         else:
             st.caption("No live sensors available")
     with col_ref:
-        if st.button("↺", key="btn_refresh_scan", help="Scan for sensors now",
-                     width="stretch"):
+        if st.button("↺", key="btn_refresh_scan", help="Scan for sensors now", width="stretch"):
             _start_scan()
             st.rerun()
 
-    # Available sensors dropdown — exclude any sensor already added (regardless of status)
+    # Sensor dropdown — exclude sensors that are already connected (by address).
     connected_addrs = {
         info["address"]
         for info in st.session_state.sensors.values()
         if "address" in info
     }
-    available = [s for s in st.session_state.known_sensors.values() if s["address"] not in connected_addrs]
+    available = [
+        s for s in st.session_state.known_sensors.values()
+        if s["address"] not in connected_addrs
+    ]
 
     col_sel, col_add = st.sidebar.columns([3, 1])
     if available:
-        # Track selection by address so the displayed item always matches the list.
-        _saved_addr = st.session_state.get("sel_sensor_addr")
+        # Track the current selection by address (not list index) so that the
+        # displayed item stays correct when the list changes between reruns.
+        _saved_addr  = st.session_state.get("sel_sensor_addr")
         _avail_addrs = [s["address"] for s in available]
         if _saved_addr not in _avail_addrs:
             st.session_state["sel_sensor_addr"] = _avail_addrs[0]
@@ -614,11 +351,11 @@ if PASCO_AVAILABLE:
         )
         st.session_state["sel_sensor_addr"] = available[new_idx]["address"]
 
-        if col_add.button("＋", key="btn_connect", width="stretch",
-                          help="Connect selected sensor"):
+        if col_add.button("＋", key="btn_connect", width="stretch", help="Connect selected sensor"):
             _start_connect(available[new_idx])
             st.rerun()
     else:
+        # Nothing to select — show a disabled placeholder.
         placeholder = "Scanning…" if st.session_state.live_discovery else "No sensors available"
         col_sel.selectbox(
             "Sensor", [placeholder],
@@ -628,13 +365,13 @@ if PASCO_AVAILABLE:
         )
         col_add.button("＋", key="btn_connect", width="stretch", disabled=True)
 
-    # Connected sensors list — in order of connection, with - disconnect button
+    # Connected sensor list with status indicators and disconnect buttons.
     if st.session_state.sensors:
         st.sidebar.markdown("---")
         for key, info in list(st.session_state.sensors.items()):
             status = info.get("status", "")
-            icon   = "🟢" if status == "connected" else \
-                     "🔴" if "error" in status else "🟡"
+            icon   = ("🟢" if status == "connected" else
+                      "🔴" if "error" in status else "🟡")
             col_lbl, col_m = st.sidebar.columns([3, 1])
             lines = [
                 f"{icon} **{info.get('quantity', '?')}**",
@@ -644,28 +381,37 @@ if PASCO_AVAILABLE:
             if status not in ("connected",):
                 lines.append(f"*{status}*")
             col_lbl.markdown("  \n".join(lines))
-            if col_m.button("－", key=f"disc_{key}", help="Disconnect",
-                            width="stretch"):
+            if col_m.button("－", key=f"disc_{key}", help="Disconnect", width="stretch"):
                 _disconnect_sensor(key)
                 st.rerun()
+
 else:
     st.sidebar.caption("Install `pasco` to enable live sensors.")
 
 
-# ── File loading ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: CSV file upload
+# ─────────────────────────────────────────────────────────────────────────────
 
 st.sidebar.markdown('<p class="sidebar-section">Load recorded data</p>', unsafe_allow_html=True)
 uploaded = st.sidebar.file_uploader("Load CSV", type="csv", label_visibility="collapsed")
 
+
 @st.cache_data
-def load_csv(source) -> pd.DataFrame:
+def _load_csv(source) -> pd.DataFrame:
     return pd.read_csv(source, low_memory=False)
 
-raw = load_csv(uploaded) if uploaded else None
+
+raw = _load_csv(uploaded) if uploaded else None
 
 
-# ── Parse column structure ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Parse CSV column structure into series metadata
+# ─────────────────────────────────────────────────────────────────────────────
 
+# Expected column formats (Pasco / SPARKvue CSV export):
+#   "Voltage (V) Run 1"   → MEAS_RE  (measurement column)
+#   "Time (s) Run 1"      → TIME_RE  (time column)
 MEAS_RE = re.compile(r"^(.+?)\s*\((.+?)\)\s*Run\s*(\d+)$", re.IGNORECASE)
 TIME_RE  = re.compile(r"^Time\s*\((.+?)\)\s*Run\s*(\d+)$",  re.IGNORECASE)
 
@@ -674,11 +420,12 @@ series_meta: dict[tuple[str, int], dict] = {}
 if raw is not None:
     for col in raw.columns:
         if TIME_RE.match(col.strip()):
-            continue
+            continue  # skip time columns; they are referenced by measurement columns
         m = MEAS_RE.match(col.strip())
         if not m:
             continue
         name, unit, run_str = m.group(1).strip(), m.group(2).strip(), int(m.group(3))
+        # Find the matching time column for this run number.
         time_col = next(
             (c for c in raw.columns
              if TIME_RE.match(c.strip()) and TIME_RE.match(c.strip()).group(2) == str(run_str)),
@@ -693,25 +440,27 @@ if raw is not None:
             "value_col": col.strip(),
         }
 
-# Build units from actual data only
+# Build a per-unit series list from the parsed metadata.
 units: dict[str, list[dict]] = {}
-
 for meta in series_meta.values():
     units.setdefault(meta["unit"], []).append(meta)
 for u in units:
     units[u].sort(key=lambda m: m["run"])
 
+# Add units that only have live data (no CSV runs).
 for live_unit, addr_bufs in st.session_state.live_buffers.items():
     if addr_bufs:
         units.setdefault(live_unit, [])
 
-# Order: V first, then A, then anything else — only units with data
+# Display order: V first, A second, then anything else.
 _UNIT_ORDER = ["V", "A"]
 units = {u: units[u] for u in _UNIT_ORDER if u in units} | \
         {u: v for u, v in units.items() if u not in _UNIT_ORDER}
 
 
-# ── Sidebar: series visibility ────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: series visibility checkboxes
+# ─────────────────────────────────────────────────────────────────────────────
 
 visibility: dict[tuple[str, int], bool] = {}
 if any(series_list for series_list in units.values()):
@@ -724,6 +473,10 @@ if any(series_list for series_list in units.values()):
                 visibility[key] = st.sidebar.checkbox(meta["label"], value=True, key=str(key))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Empty state — nothing to show yet
+# ─────────────────────────────────────────────────────────────────────────────
+
 if not units:
     st.info("Connect a sensor or load a CSV to see data.")
     if PASCO_AVAILABLE:
@@ -733,6 +486,7 @@ if not units:
             and "error" not in info.get("status", "")
             for info in st.session_state.sensors.values()
         )
+        # Keep refreshing while a scan or connection is in progress.
         if _ss["in_progress"] or _conn_pending:
             time.sleep(0.3)
             st.rerun()
@@ -742,8 +496,72 @@ if not units:
             st.rerun()
     st.stop()
 
-# ── Plot ──────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Flush live data into the recording buffer (every render pass)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_flush_live_to_record()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Toolbar: Download CSV link
+# ─────────────────────────────────────────────────────────────────────────────
+
+if st.session_state.record_data:
+    _b64 = base64.b64encode(_download_csv()).decode()
+    _dl_html = (
+        f'<div class="toolbar-dl">'
+        f'<a href="data:text/csv;base64,{_b64}" download="recording.csv">↓ Download CSV</a>'
+        f'</div>'
+    )
+else:
+    _dl_html = (
+        '<div class="toolbar-dl">'
+        '<a style="opacity:0.35;cursor:default;pointer-events:none;">↓ Download CSV</a>'
+        '</div>'
+    )
+st.markdown(_dl_html, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Record / Stop bar
+# ─────────────────────────────────────────────────────────────────────────────
+
+_any_connected = any(
+    info.get("status") == "connected"
+    for info in st.session_state.sensors.values()
+)
+
+rec_left, rec_mid, rec_right = st.columns([2, 1, 2])
+with rec_mid:
+    if st.session_state.recording:
+        rec_pts = sum(
+            len(pts)
+            for sensor_map in st.session_state.record_data.values()
+            for pts in sensor_map.values()
+        )
+        st.button(
+            f"■  Stop  ({rec_pts} pts)",
+            key="btn_stop_rec",
+            width="stretch",
+            type="primary",
+            on_click=_stop_recording,
+        )
+    elif _any_connected:
+        st.button(
+            "●  Record",
+            key="btn_start_rec",
+            width="stretch",
+            on_click=_start_recording,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Colour palettes — file data uses cool/neutral colours, live data uses vivid colours.
 FILE_COLORS = [
     "#3b82f6", "#f97316", "#10b981", "#ef4444", "#8b5cf6",
     "#06b6d4", "#f59e0b", "#6366f1", "#84cc16", "#ec4899",
@@ -754,27 +572,30 @@ LIVE_COLORS = [
 
 unit_list = list(units.keys())
 n_units   = len(unit_list)
-SPACING   = 0.06
+SPACING   = 0.06  # vertical gap between subplots as a fraction of figure height
 
-fig = make_subplots(rows=n_units, cols=1, shared_xaxes=True, vertical_spacing=SPACING)
+fig       = make_subplots(rows=n_units, cols=1, shared_xaxes=True, vertical_spacing=SPACING)
 
 plot_h        = (1.0 - SPACING * (n_units - 1)) / n_units
-MODEBAR_PX    = 44
 FIG_HEIGHT    = 400 * n_units
-MODEBAR_PAPER = MODEBAR_PX / FIG_HEIGHT
+MODEBAR_PX    = 44
+MODEBAR_PAPER = MODEBAR_PX / FIG_HEIGHT   # modebar height in paper-space units
 
-# Build per-unit legends
+# Build one legend per subplot so that each unit has its own independent legend.
 legend_layout: dict = {}
 for idx, unit in enumerate(unit_list):
     row    = idx + 1
     top_y  = 1.0 - (row - 1) * (plot_h + SPACING)
     if idx == 0:
-        top_y -= MODEBAR_PAPER
-    legend_key = "legend" if idx == 0 else f"legend{idx + 1}"
+        top_y -= MODEBAR_PAPER  # leave room for the modebar above the first subplot
+    legend_key  = "legend" if idx == 0 else f"legend{idx + 1}"
     series_list = units[unit]
-    _unit_name  = next((info["quantity"] for info in st.session_state.sensors.values()
-                        if info.get("unit") == unit), unit)
-    full_name   = series_list[0]["name"] if series_list else _unit_name
+    # Prefer the full measurement name from CSV metadata; fall back to live sensor quantity.
+    _unit_name  = next(
+        (info["quantity"] for info in st.session_state.sensors.values() if info.get("unit") == unit),
+        unit,
+    )
+    full_name = series_list[0]["name"] if series_list else _unit_name
     legend_layout[legend_key] = dict(
         x=1.01, xanchor="left",
         y=top_y, yanchor="top",
@@ -784,6 +605,7 @@ for idx, unit in enumerate(unit_list):
         font=dict(size=13),
     )
 
+# Crosshair spike lines shown on hover (shared across all subplots via shared_xaxes).
 SPIKE = dict(
     showspikes=True, spikemode="across", spikesnap="cursor",
     spikethickness=0.75, spikecolor="rgba(160,160,160,0.45)", spikedash="solid",
@@ -793,7 +615,7 @@ for row, unit in enumerate(unit_list, start=1):
     legend_ref  = "legend" if row == 1 else f"legend{row}"
     series_list = units[unit]
 
-    # ── File traces ───────────────────────────────────────────────────────────
+    # File traces (CSV data)
     for i, meta in enumerate(series_list):
         key = (meta["unit"], meta["run"])
         if not visibility.get(key, True):
@@ -813,33 +635,39 @@ for row, unit in enumerate(unit_list, start=1):
             line=dict(color=FILE_COLORS[i % len(FILE_COLORS)], width=1.5),
         ), row=row, col=1)
 
-    # ── Live traces ───────────────────────────────────────────────────────────
+    # Live traces (BLE sensor data)
     addr_bufs = st.session_state.live_buffers.get(unit, {})
-    for j, (addr, buf) in enumerate(addr_bufs.items()):
+    for j, (sensor_key, buf) in enumerate(addr_bufs.items()):
         if not buf:
             continue
-        sensor_info = st.session_state.sensors.get(addr, {})
-        label       = sensor_info.get("label", addr[-6:])
-        pts  = list(buf)                      # snapshot — thread appends concurrently
-        ts   = [p[0] for p in pts]
-        vs   = [p[1] for p in pts]
+        sensor_info = st.session_state.sensors.get(sensor_key, {})
+        label       = sensor_info.get("label", sensor_key[-6:])
+        pts = list(buf)  # snapshot — streaming thread may append concurrently
         fig.add_trace(go.Scatter(
-            x=ts, y=vs,
+            x=[p[0] for p in pts],
+            y=[p[1] for p in pts],
             mode="lines",
-            name=f"{label}",
+            name=label,
             legend=legend_ref,
             line=dict(color=LIVE_COLORS[j % len(LIVE_COLORS)], width=2, dash="dot"),
         ), row=row, col=1)
 
-    _unit_label = next((info["quantity"] for info in st.session_state.sensors.values()
-                        if info.get("unit") == unit), unit)
+    # Axis labels
+    _unit_label = next(
+        (info["quantity"] for info in st.session_state.sensors.values() if info.get("unit") == unit),
+        unit,
+    )
     meas_name = units[unit][0]["name"] if units[unit] else _unit_label
-    fig.update_yaxes(title_text=f"{meas_name} [{unit}]",
-                     title_font=dict(size=13), tickfont=dict(size=12),
-                     fixedrange=False, **SPIKE, row=row, col=1)
-    fig.update_xaxes(title_text="Time [s]",
-                     title_font=dict(size=13), tickfont=dict(size=12),
-                     **SPIKE, row=row, col=1)
+    fig.update_yaxes(
+        title_text=f"{meas_name} [{unit}]",
+        title_font=dict(size=13), tickfont=dict(size=12),
+        fixedrange=False, **SPIKE, row=row, col=1,
+    )
+    fig.update_xaxes(
+        title_text="Time [s]",
+        title_font=dict(size=13), tickfont=dict(size=12),
+        **SPIKE, row=row, col=1,
+    )
 
 fig.update_layout(
     font=dict(family="Inter, sans-serif", size=13),
@@ -854,70 +682,31 @@ fig.update_layout(
     **legend_layout,
 )
 
-# Flush live data into record buffers on every render pass
-_flush_live_to_record()
-
-# ── Toolbar download link (fixed position, replaces deploy button) ─────────────
-_has_data = bool(st.session_state.record_data)
-if _has_data:
-    _b64 = base64.b64encode(_download_csv()).decode()
-    _dl_html = (
-        f'<div class="toolbar-dl">'
-        f'<a href="data:text/csv;base64,{_b64}" download="recording.csv">↓ Download CSV</a>'
-        f'</div>'
-    )
-else:
-    _dl_html = (
-        '<div class="toolbar-dl">'
-        '<a style="opacity:0.35;cursor:default;pointer-events:none;">↓ Download CSV</a>'
-        '</div>'
-    )
-st.markdown(_dl_html, unsafe_allow_html=True)
-
-# ── Record / Stop bar ─────────────────────────────────────────────────────────
-_any_connected = any(
-    info.get("status") == "connected"
-    for info in st.session_state.sensors.values()
-)
-rec_left, rec_mid, rec_right = st.columns([2, 1, 2])
-with rec_mid:
-    if st.session_state.recording:
-        rec_pts = sum(
-            len(pts)
-            for addr_map in st.session_state.record_data.values()
-            for pts in addr_map.values()
-        )
-        st.button(f"■  Stop  ({rec_pts} pts)", key="btn_stop_rec",
-                  width="stretch", type="primary",
-                  on_click=_stop_recording)
-    elif _any_connected:
-        st.button("●  Record", key="btn_start_rec",
-                  width="stretch",
-                  on_click=_start_recording)
-
 st.plotly_chart(fig, width="stretch")
 
 
-# ── Raw data preview ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Raw data preview (CSV only)
+# ─────────────────────────────────────────────────────────────────────────────
 
 if raw is not None:
     with st.expander("Raw data"):
         st.dataframe(raw, width="stretch")
 
 
-# ── Auto-refresh ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Auto-refresh
+# ─────────────────────────────────────────────────────────────────────────────
 
-_sensors_active = any(
-    info.get("status") not in ("connected", "disconnected") and
-    "error" not in info.get("status", "")
+# Rerun while any sensor is connecting or a scan is in progress so the UI
+# stays responsive without the user having to interact.
+_sensors_transitioning = any(
+    info.get("status") not in ("connected", "disconnected")
+    and "error" not in info.get("status", "")
     for info in st.session_state.sensors.values()
 )
 _scan_active = PASCO_AVAILABLE and st.session_state.scan_state["in_progress"]
 
-if _scan_active or _sensors_active or (_any_connected and st.session_state.recording):
+if _scan_active or _sensors_transitioning or (_any_connected and st.session_state.recording):
     time.sleep(0.3)
-    st.rerun()
-elif PASCO_AVAILABLE and st.session_state.live_discovery and st.session_state.scan_state["last_time"] > 0:
-    time_since = time.time() - st.session_state.scan_state["last_time"]
-    time.sleep(min(1.0, max(0.1, SCAN_INTERVAL_S - time_since)))
     st.rerun()
