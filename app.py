@@ -280,24 +280,48 @@ def _render_live_indicator() -> None:
 # Session state initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
-# sensors:       {key: {status, label, unit, meas_name, stop_event, thread, …}}
-# live_buffers:  {unit: {sensor_key: deque[(elapsed_s, value)]}}
-# record_data:   {unit: {sensor_key: [(t, v), …]}}
-# record_last_t: {(unit, sensor_key): float}  — watermark for flush
-# scan_state:    {in_progress: bool, last_time: float, results: [parsed-device-dict]}
-# known_sensors: {address: parsed-device-dict}  — persists across scans
+# managed_addrs : set[str]        addresses currently in the sensor list
+#                                  modified ONLY by on_click callbacks, never by threads
+# connections   : dict[str, dict] per-connection details; background thread writes here
+# sensor_meta   : dict[str, dict] metadata cache for display (dropdown fallback + sensor list identity)
+# live_buffers  : {unit: {addr: deque[(elapsed_s, value)]}}
+# record_data   : {unit: {addr: [(t, v), …]}}
+# record_last_t : {(unit, addr): float}  watermark for flush
+# scan_state    : {in_progress, last_time, results}
 
-st.session_state.setdefault("sensors",       {})
-st.session_state.setdefault("live_buffers",  {})
-st.session_state.setdefault("record_data",   {})
-st.session_state.setdefault("record_last_t", {})
-st.session_state.setdefault("recording",     False)
-st.session_state.setdefault("sensor_counter", 0)
-st.session_state.setdefault("scan_state",    {"in_progress": False, "last_time": 0.0, "results": []})
-st.session_state.setdefault("known_sensors", {})  # address → entry; populated by scans
-st.session_state.setdefault("live_discovery", True)
+st.session_state.setdefault("managed_addrs",  set())
+st.session_state.setdefault("connections",     {})
+st.session_state.setdefault("sensor_meta",     {})
+st.session_state.setdefault("live_buffers",    {})
+st.session_state.setdefault("record_data",     {})
+st.session_state.setdefault("record_last_t",   {})
+st.session_state.setdefault("recording",       False)
+st.session_state.setdefault("scan_state",      {"in_progress": False, "last_time": 0.0, "results": []})
+st.session_state.setdefault("live_discovery",  True)
+# x_range_initialized: True after the plot has been shown once with [0, 10].
+# Reset to False when all units disappear so the next sensor connection re-initialises.
+st.session_state.setdefault("x_range_initialized", False)
+# recorded_sessions: list of finalised recording sessions, each a dict with
+# keys: id, label (HH:MM:SS), data ({unit: {sensor_key: [(t,v)]}}), sensor_labels.
+st.session_state.setdefault("recorded_sessions",    [])
+# record_sensor_labels: {sensor_key: label} populated during flush so that
+# labels are captured even if the sensor disconnects before Stop is pressed.
+st.session_state.setdefault("record_sensor_labels", {})
 
 _render_live_indicator()
+
+# Safety sweep: when a streaming thread exits unexpectedly (sensor turned off
+# or out of range) it writes conn["status"] = "disconnected" to the conn dict
+# it holds.  This sweep detects that signal and calls _disconnect_sensor so the
+# address is removed from managed_addrs and the sensor reappears in the dropdown.
+if PASCO_AVAILABLE:
+    _stale_addrs = [
+        addr for addr in list(st.session_state.managed_addrs)
+        if st.session_state.connections.get(addr, {}).get("status") == "disconnected"
+    ]
+    if _stale_addrs:
+        for _addr in _stale_addrs:
+            _disconnect_sensor(_addr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,9 +355,26 @@ if PASCO_AVAILABLE:
     ):
         _start_scan()
 
+    _now = time.time()
+
+    # Update sensor_meta with fresh scan results (for sensors not currently managed).
+    # This keeps metadata up-to-date with live ble_device objects for reconnection.
+    for _entry in scan_state.get("results", []):
+        _addr = _entry["address"]
+        if _addr not in st.session_state.managed_addrs:
+            st.session_state.sensor_meta[_addr] = {**_entry, "_last_seen_at": _now}
+
+    # Expire sensor_meta entries that are not managed and have not been seen in
+    # recent scans (device is likely off).
+    for _addr in list(st.session_state.sensor_meta):
+        _meta = st.session_state.sensor_meta[_addr]
+        if (_addr not in st.session_state.managed_addrs
+                and _addr not in {e["address"] for e in scan_state.get("results", [])}
+                and _now - _meta.get("_last_seen_at", _now) > SCAN_INTERVAL_S * 2):
+            del st.session_state.sensor_meta[_addr]
+
     st.sidebar.markdown('<p class="sidebar-section">Live sensors</p>', unsafe_allow_html=True)
 
-    # Scan status caption + manual refresh button
     col_cap, col_ref = st.sidebar.columns([3, 1])
     with col_cap:
         if scan_state["last_time"] > 0:
@@ -344,70 +385,80 @@ if PASCO_AVAILABLE:
         else:
             st.caption("No live sensors available")
     with col_ref:
-        if st.button("↺", key="btn_refresh_scan", help="Scan for sensors now", width="stretch"):
-            _start_scan()
-            st.rerun()
+        st.button("↺", key="btn_refresh_scan", help="Scan for sensors now",
+                  width="stretch", on_click=_start_scan)
 
-    # Sensor dropdown — exclude sensors that are already connected (by address).
-    connected_addrs = {
-        info["address"]
-        for info in st.session_state.sensors.values()
-        if "address" in info
-    }
-    available = [
-        s for s in st.session_state.known_sensors.values()
-        if s["address"] not in connected_addrs
-    ]
+    # Build the available-sensor list (sensors NOT in managed_addrs).
+    available = []
+    _seen_in_available = set()
+    for _entry in scan_state.get("results", []):
+        if _entry["address"] not in st.session_state.managed_addrs:
+            available.append(_entry)
+            _seen_in_available.add(_entry["address"])
+    for _addr, _meta in st.session_state.sensor_meta.items():
+        if _addr not in st.session_state.managed_addrs and _addr not in _seen_in_available:
+            available.append({**_meta, "ble_device": None})
 
-    col_sel, col_add = st.sidebar.columns([3, 1])
-    if available:
-        # Track the current selection by address (not list index) so that the
-        # displayed item stays correct when the list changes between reruns.
-        _saved_addr  = st.session_state.get("sel_sensor_addr")
-        _avail_addrs = [s["address"] for s in available]
-        if _saved_addr not in _avail_addrs:
-            st.session_state["sel_sensor_addr"] = _avail_addrs[0]
-            _saved_addr = _avail_addrs[0]
-        _cur_idx = _avail_addrs.index(_saved_addr)
+    # Reserve two sidebar slots in visual order (dropdown on top, sensor list below).
+    # The slots are filled in REVERSE order so the sensor-list delta reaches the
+    # browser before the dropdown delta — eliminating the brief window where a
+    # disconnecting sensor would appear in both places simultaneously.
+    _dropdown_slot     = st.sidebar.empty()
+    _sensor_list_slot  = st.sidebar.empty()
 
-        new_idx = col_sel.selectbox(
-            "Sensor",
-            options=range(len(available)),
-            index=_cur_idx,
-            format_func=lambda i: _sensor_display_label(available[i]),
-            label_visibility="collapsed",
-        )
-        st.session_state["sel_sensor_addr"] = available[new_idx]["address"]
-
-        if col_add.button("＋", key="btn_connect", width="stretch", help="Connect selected sensor"):
-            _start_connect(available[new_idx])
-            st.rerun()
+    # ── Fill sensor list first ────────────────────────────────────────────────
+    if st.session_state.managed_addrs:
+        with _sensor_list_slot.container():
+            st.markdown("---")
+            for _addr in sorted(st.session_state.managed_addrs):
+                _conn = st.session_state.connections.get(_addr, {})
+                _meta = st.session_state.sensor_meta.get(_addr, {})
+                _status = _conn.get("status", "")
+                _icon   = ("🟢" if _status == "connected" else
+                           "🔴" if "error" in _status else "🟡")
+                col_lbl, col_m = st.columns([3, 1])
+                _lbl = (f"{_icon} **{_meta.get('quantity', '?')}** "
+                        f"ᛒ {_meta.get('sensor_id', '')}")
+                if _status not in ("connected",):
+                    _lbl += f"  \n*{_status}*"
+                col_lbl.markdown(_lbl)
+                col_m.button("－", key=f"disc_{_addr}", help="Disconnect",
+                             width="stretch",
+                             disabled=(_status == "disconnecting…"),
+                             on_click=_disconnect_sensor, args=(_addr,))
     else:
-        # Nothing to select — show a disabled placeholder.
-        placeholder = "Scanning…" if st.session_state.live_discovery else "No sensors available"
-        col_sel.selectbox(
-            "Sensor", [placeholder],
-            label_visibility="collapsed",
-            disabled=True,
-            key="sel_sensor_placeholder",
-        )
-        col_add.button("＋", key="btn_connect", width="stretch", disabled=True)
+        _sensor_list_slot.empty()
 
-    # Connected sensor list with status indicators and disconnect buttons.
-    if st.session_state.sensors:
-        st.sidebar.markdown("---")
-        for key, info in list(st.session_state.sensors.items()):
-            status = info.get("status", "")
-            icon   = ("🟢" if status == "connected" else
-                      "🔴" if "error" in status else "🟡")
-            col_lbl, col_m = st.sidebar.columns([3, 1])
-            label = f"{icon} **{info.get('quantity', '?')}** {_BT_SVG} {info.get('sensor_id', '')}"
-            if status not in ("connected",):
-                label += f"  \n*{status}*"
-            col_lbl.markdown(label, unsafe_allow_html=True)
-            if col_m.button("－", key=f"disc_{key}", help="Disconnect", width="stretch"):
-                _disconnect_sensor(key)
-                st.rerun()
+    # ── Fill dropdown second ──────────────────────────────────────────────────
+    with _dropdown_slot.container():
+        col_sel, col_add = st.columns([3, 1])
+        if available:
+            _saved_addr  = st.session_state.get("sel_sensor_addr")
+            _avail_addrs = [s["address"] for s in available]
+            if _saved_addr not in _avail_addrs:
+                st.session_state["sel_sensor_addr"] = _avail_addrs[0]
+                _saved_addr = _avail_addrs[0]
+            _cur_idx = _avail_addrs.index(_saved_addr)
+            new_idx = col_sel.selectbox(
+                "Sensor",
+                options=range(len(available)),
+                index=_cur_idx,
+                format_func=lambda i: _sensor_display_label(available[i]),
+                label_visibility="collapsed",
+            )
+            st.session_state["sel_sensor_addr"] = available[new_idx]["address"]
+            col_add.button("＋", key="btn_connect", width="stretch",
+                           help="Connect selected sensor",
+                           on_click=_start_connect, args=(available[new_idx],))
+        else:
+            placeholder = "Scanning…" if st.session_state.live_discovery else "No sensors available"
+            col_sel.selectbox(
+                "Sensor", [placeholder],
+                label_visibility="collapsed",
+                disabled=True,
+                key="sel_sensor_placeholder",
+            )
+            col_add.button("＋", key="btn_connect", width="stretch", disabled=True)
 
 else:
     st.sidebar.caption("Install `pasco` to enable live sensors.")
@@ -448,60 +499,99 @@ if raw is not None:
             "value_col": col.strip(),
         }
 
-# Build a per-unit series list from the parsed metadata.
-units: dict[str, list[dict]] = {}
-for meta in series_meta.values():
-    units.setdefault(meta["unit"], []).append(meta)
-for u in units:
-    units[u].sort(key=lambda m: m["run"])
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidebar: selected measurements (CSV runs + recorded sessions)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Add units that only have live data (no CSV runs).
+# csv_run_visible: {run_number: bool} — one checkbox per CSV run.
+# rec_session_visible: {session_id: bool} — one checkbox per recorded session.
+# No unit headers: a measurement may contain multiple signals across units.
+csv_run_visible:     dict[int, bool] = {}
+rec_session_visible: dict[str, bool] = {}
+
+_has_csv_runs = bool(series_meta)
+_has_recorded = bool(st.session_state.recorded_sessions)
+
+if _has_csv_runs or _has_recorded:
+    st.sidebar.markdown(
+        '<p class="sidebar-section">Selected measurements</p>', unsafe_allow_html=True
+    )
+
+    # CSV runs — one entry per run number (covers all units in that run).
+    if _has_csv_runs:
+        for run in sorted({meta["run"] for meta in series_meta.values()}):
+            csv_run_visible[run] = st.sidebar.checkbox(
+                f"Run {run}", value=True, key=f"csv_run_{run}"
+            )
+
+    if _has_csv_runs and _has_recorded:
+        st.sidebar.markdown("---")
+
+    # Recorded sessions — labelled with the HH:MM:SS of when recording stopped.
+    for session in st.session_state.recorded_sessions:
+        rec_session_visible[session["id"]] = st.sidebar.checkbox(
+            session["label"], value=True, key=f"rec_{session['id']}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Collect all units that have visible data → unit_list drives the plot layout
+# ─────────────────────────────────────────────────────────────────────────────
+
+_plot_units: set[str] = set()
+
+# CSV: include units from visible runs.
+for (unit, run) in series_meta:
+    if csv_run_visible.get(run, True):
+        _plot_units.add(unit)
+
+# Recorded sessions: include units from visible sessions.
+for session in st.session_state.recorded_sessions:
+    if rec_session_visible.get(session["id"], True):
+        _plot_units.update(session["data"].keys())
+
+# Live sensors: include units from actively streaming sensors.
+# Only count buffers whose address is still a managed sensor — orphaned buffers
+# from zombie connect threads must not create ghost subplots.
 for live_unit, addr_bufs in st.session_state.live_buffers.items():
-    if addr_bufs:
-        units.setdefault(live_unit, [])
+    if any(a in st.session_state.managed_addrs for a in addr_bufs):
+        _plot_units.add(live_unit)
 
-# Display order: V first, A second, then anything else.
+# Display order: V first, A second, then alphabetical for anything else.
 _UNIT_ORDER = ["V", "A"]
-units = {u: units[u] for u in _UNIT_ORDER if u in units} | \
-        {u: v for u, v in units.items() if u not in _UNIT_ORDER}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar: series visibility checkboxes
-# ─────────────────────────────────────────────────────────────────────────────
-
-visibility: dict[tuple[str, int], bool] = {}
-if any(series_list for series_list in units.values()):
-    st.sidebar.markdown('<p class="sidebar-section">Select measurements</p>', unsafe_allow_html=True)
-    for unit, series_list in units.items():
-        if series_list:
-            st.sidebar.markdown(f"**{series_list[0]['name']} [{unit}]**")
-            for meta in series_list:
-                key = (meta["unit"], meta["run"])
-                visibility[key] = st.sidebar.checkbox(meta["label"], value=True, key=str(key))
+unit_list = (
+    [u for u in _UNIT_ORDER if u in _plot_units] +
+    [u for u in sorted(_plot_units) if u not in _UNIT_ORDER]
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Empty state — nothing to show yet
 # ─────────────────────────────────────────────────────────────────────────────
 
-if not units:
-    st.info("Connect a sensor or load a CSV to see data.")
+if not unit_list:
+    st.session_state.x_range_initialized = False
     if PASCO_AVAILABLE:
         _ss = st.session_state.scan_state
         _conn_pending = any(
-            info.get("status") not in ("connected", "disconnected")
-            and "error" not in info.get("status", "")
-            for info in st.session_state.sensors.values()
+            st.session_state.connections.get(addr, {}).get("status")
+            not in ("connected", "disconnected")
+            and "error" not in st.session_state.connections.get(addr, {}).get("status", "")
+            for addr in st.session_state.managed_addrs
         )
-        # Keep refreshing while a scan or connection is in progress.
+        # While connecting, stay silent — the sensor list in the sidebar already
+        # shows the status.  Only show the hint when there is genuinely nothing happening.
         if _ss["in_progress"] or _conn_pending:
             time.sleep(0.3)
             st.rerun()
-        elif st.session_state.live_discovery and _ss["last_time"] > 0:
-            time_since = time.time() - _ss["last_time"]
-            time.sleep(min(1.0, max(0.1, SCAN_INTERVAL_S - time_since)))
-            st.rerun()
+        else:
+            st.info("Connect a sensor or load a CSV to see data.")
+            if st.session_state.live_discovery and _ss["last_time"] > 0:
+                time_since = time.time() - _ss["last_time"]
+                time.sleep(min(1.0, max(0.1, SCAN_INTERVAL_S - time_since)))
+                st.rerun()
+    else:
+        st.info("Connect a sensor or load a CSV to see data.")
     st.stop()
 
 
@@ -516,7 +606,7 @@ _flush_live_to_record()
 # Toolbar: Download CSV link
 # ─────────────────────────────────────────────────────────────────────────────
 
-if st.session_state.record_data:
+if st.session_state.recorded_sessions:
     _b64 = base64.b64encode(_download_csv()).decode()
     _dl_html = (
         f'<div class="toolbar-dl">'
@@ -537,8 +627,8 @@ st.markdown(_dl_html, unsafe_allow_html=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _any_connected = any(
-    info.get("status") == "connected"
-    for info in st.session_state.sensors.values()
+    st.session_state.connections.get(addr, {}).get("status") == "connected"
+    for addr in st.session_state.managed_addrs
 )
 
 rec_left, rec_mid, rec_right = st.columns([2, 1, 2])
@@ -569,7 +659,8 @@ with rec_mid:
 # Plot
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Colour palettes — file data uses cool/neutral colours, live data uses vivid colours.
+# Colour palettes — static data (CSV + recorded) uses cool/neutral colours;
+# live sensor data uses vivid dotted lines so it is visually distinct.
 FILE_COLORS = [
     "#3b82f6", "#f97316", "#10b981", "#ef4444", "#8b5cf6",
     "#06b6d4", "#f59e0b", "#6366f1", "#84cc16", "#ec4899",
@@ -578,11 +669,51 @@ LIVE_COLORS = [
     "#ff006e", "#fb5607", "#ffbe0b", "#8338ec", "#3a86ff",
 ]
 
-unit_list = list(units.keys())
-n_units   = len(unit_list)
-SPACING   = 0.06  # vertical gap between subplots as a fraction of figure height
+# Pre-compute stable colors for CSV runs and recorded sessions so that the
+# same run/session always gets the same color regardless of which subplot is
+# being rendered.  Live sensors use LIVE_COLORS independently.
+_color_idx      = 0
+csv_run_colors: dict[int, str] = {}
+for _run in sorted(csv_run_visible):
+    if csv_run_visible[_run]:
+        csv_run_colors[_run] = FILE_COLORS[_color_idx % len(FILE_COLORS)]
+        _color_idx          += 1
 
-fig       = make_subplots(rows=n_units, cols=1, shared_xaxes=True, vertical_spacing=SPACING)
+session_colors: dict[str, str] = {}
+for _sess in st.session_state.recorded_sessions:
+    if rec_session_visible.get(_sess["id"], True):
+        session_colors[_sess["id"]] = FILE_COLORS[_color_idx % len(FILE_COLORS)]
+        _color_idx                 += 1
+
+
+def _unit_display_name(unit: str) -> str:
+    """Return a human-readable measurement name for the given physical unit.
+
+    Checks CSV metadata first (has explicit names like 'Voltage'), then live
+    sensors, then recorded session labels.  Falls back to the unit string.
+    """
+    for (u, _), meta in series_meta.items():
+        if u == unit:
+            return meta["name"]
+    for addr in st.session_state.managed_addrs:
+        if st.session_state.connections.get(addr, {}).get("unit") == unit:
+            return st.session_state.sensor_meta.get(addr, {}).get("quantity", unit)
+    for _sess in st.session_state.recorded_sessions:
+        for u, sensor_map in _sess["data"].items():
+            if u == unit:
+                for sk in sensor_map:
+                    lbl = _sess["sensor_labels"].get(sk, "")
+                    if lbl:
+                        return lbl
+    return unit
+
+
+n_units   = len(unit_list)
+# Wider spacing than the default 0.06: every subplot shows its own x-axis labels,
+# so we need room for the tick labels and axis title between rows.
+SPACING   = 0.12
+
+fig = make_subplots(rows=n_units, cols=1, shared_xaxes=True, vertical_spacing=SPACING)
 
 plot_h        = (1.0 - SPACING * (n_units - 1)) / n_units
 FIG_HEIGHT    = 400 * n_units
@@ -592,18 +723,12 @@ MODEBAR_PAPER = MODEBAR_PX / FIG_HEIGHT   # modebar height in paper-space units
 # Build one legend per subplot so that each unit has its own independent legend.
 legend_layout: dict = {}
 for idx, unit in enumerate(unit_list):
-    row    = idx + 1
-    top_y  = 1.0 - (row - 1) * (plot_h + SPACING)
+    row        = idx + 1
+    top_y      = 1.0 - (row - 1) * (plot_h + SPACING)
     if idx == 0:
         top_y -= MODEBAR_PAPER  # leave room for the modebar above the first subplot
-    legend_key  = "legend" if idx == 0 else f"legend{idx + 1}"
-    series_list = units[unit]
-    # Prefer the full measurement name from CSV metadata; fall back to live sensor quantity.
-    _unit_name  = next(
-        (info["quantity"] for info in st.session_state.sensors.values() if info.get("unit") == unit),
-        unit,
-    )
-    full_name = series_list[0]["name"] if series_list else _unit_name
+    legend_key = "legend" if idx == 0 else f"legend{idx + 1}"
+    full_name  = _unit_display_name(unit)
     legend_layout[legend_key] = dict(
         x=1.01, xanchor="left",
         y=top_y, yanchor="top",
@@ -620,36 +745,58 @@ SPIKE = dict(
 )
 
 for row, unit in enumerate(unit_list, start=1):
-    legend_ref  = "legend" if row == 1 else f"legend{row}"
-    series_list = units[unit]
+    legend_ref = "legend" if row == 1 else f"legend{row}"
 
-    # File traces (CSV data)
-    for i, meta in enumerate(series_list):
-        key = (meta["unit"], meta["run"])
-        if not visibility.get(key, True):
-            continue
-        time_col  = meta["time_col"]
-        value_col = meta["value_col"]
+    # ── CSV traces (solid lines, color per run) ───────────────────────────────
+    for run in sorted(run for (u, run) in series_meta if u == unit and csv_run_visible.get(run, True)):
+        meta     = series_meta[(unit, run)]
+        time_col = meta["time_col"]
         if time_col is None or raw is None:
             continue
-        t = pd.to_numeric(raw[time_col],  errors="coerce")
-        v = pd.to_numeric(raw[value_col], errors="coerce")
+        t    = pd.to_numeric(raw[time_col],          errors="coerce")
+        v    = pd.to_numeric(raw[meta["value_col"]], errors="coerce")
         mask = t.notna() & v.notna()
         fig.add_trace(go.Scatter(
             x=t[mask], y=v[mask],
             mode="lines",
-            name=meta["label"],
+            name=meta["label"],                  # "Run N"
             legend=legend_ref,
-            line=dict(color=FILE_COLORS[i % len(FILE_COLORS)], width=1.5),
+            line=dict(color=csv_run_colors[run], width=1.5),
         ), row=row, col=1)
 
-    # Live traces (BLE sensor data)
-    addr_bufs = st.session_state.live_buffers.get(unit, {})
-    for j, (sensor_key, buf) in enumerate(addr_bufs.items()):
-        if not buf:
+    # ── Recorded session traces (solid lines, color per session) ──────────────
+    for session in st.session_state.recorded_sessions:
+        if not rec_session_visible.get(session["id"], True):
             continue
-        sensor_info = st.session_state.sensors.get(sensor_key, {})
-        label       = sensor_info.get("label", sensor_key[-6:])
+        sensor_map = session["data"].get(unit, {})
+        if not sensor_map:
+            continue
+        color = session_colors[session["id"]]
+        for sensor_key, pts in sensor_map.items():
+            sensor_label = session["sensor_labels"].get(sensor_key, sensor_key[-6:])
+            # Include sensor label in the trace name only when a session has
+            # multiple sensors for the same unit (unusual but possible).
+            trace_name = (
+                f"{session['label']} — {sensor_label}"
+                if len(sensor_map) > 1
+                else session["label"]
+            )
+            fig.add_trace(go.Scatter(
+                x=[p[0] for p in pts],
+                y=[p[1] for p in pts],
+                mode="lines",
+                name=trace_name,
+                legend=legend_ref,
+                line=dict(color=color, width=1.5),
+            ), row=row, col=1)
+
+    # ── Live traces (dotted lines, vivid colors) ──────────────────────────────
+    # Ephemeral: only rendered while the sensor is actively connected.
+    addr_bufs = st.session_state.live_buffers.get(unit, {})
+    for j, (addr, buf) in enumerate(addr_bufs.items()):
+        if addr not in st.session_state.managed_addrs or not buf:
+            continue
+        label = st.session_state.connections.get(addr, {}).get("label", addr[-6:])
         pts = list(buf)  # snapshot — streaming thread may append concurrently
         fig.add_trace(go.Scatter(
             x=[p[0] for p in pts],
@@ -660,12 +807,8 @@ for row, unit in enumerate(unit_list, start=1):
             line=dict(color=LIVE_COLORS[j % len(LIVE_COLORS)], width=2, dash="dot"),
         ), row=row, col=1)
 
-    # Axis labels
-    _unit_label = next(
-        (info["quantity"] for info in st.session_state.sensors.values() if info.get("unit") == unit),
-        unit,
-    )
-    meas_name = units[unit][0]["name"] if units[unit] else _unit_label
+    # ── Axis labels ───────────────────────────────────────────────────────────
+    meas_name = _unit_display_name(unit)
     fig.update_yaxes(
         title_text=f"{meas_name} [{unit}]",
         title_font=dict(size=13), tickfont=dict(size=12),
@@ -674,6 +817,7 @@ for row, unit in enumerate(unit_list, start=1):
     fig.update_xaxes(
         title_text="Time [s]",
         title_font=dict(size=13), tickfont=dict(size=12),
+        showticklabels=True,  # show on every row (shared_xaxes hides non-bottom rows by default)
         **SPIKE, row=row, col=1,
     )
 
@@ -687,10 +831,22 @@ fig.update_layout(
     plot_bgcolor="rgba(0,0,0,0)",
     paper_bgcolor="rgba(0,0,0,0)",
     margin=dict(l=10, r=145, t=10, b=40),
+    # uirevision: when this value stays constant across reruns, Plotly.js preserves
+    # the user's zoom/pan state even though the Python figure is rebuilt every time.
+    # This means "don't recreate the view for existing plots" — only new units get
+    # the default initialisation below.
+    uirevision="timeseries",
     **legend_layout,
 )
 
-st.plotly_chart(fig, width="stretch")
+# Initialise the x-axis to 10 s on the very first render.  After that, uirevision
+# prevents Plotly.js from resetting whatever range the user has set.
+# shared_xaxes=True means this range applies to all subplots simultaneously.
+if not st.session_state.x_range_initialized:
+    fig.update_xaxes(range=[0, 10])
+    st.session_state.x_range_initialized = True
+
+st.plotly_chart(fig, width="stretch", key="main_plot")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -709,9 +865,10 @@ if raw is not None:
 # Rerun while any sensor is connecting or a scan is in progress so the UI
 # stays responsive without the user having to interact.
 _sensors_transitioning = any(
-    info.get("status") not in ("connected", "disconnected")
-    and "error" not in info.get("status", "")
-    for info in st.session_state.sensors.values()
+    st.session_state.connections.get(addr, {}).get("status")
+    not in ("connected", "disconnected")
+    and "error" not in st.session_state.connections.get(addr, {}).get("status", "")
+    for addr in st.session_state.managed_addrs
 )
 _scan_active = PASCO_AVAILABLE and st.session_state.scan_state["in_progress"]
 
