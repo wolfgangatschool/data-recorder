@@ -659,14 +659,22 @@ with rec_mid:
 # Plot
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Colour palettes — static data (CSV + recorded) uses cool/neutral colours;
-# live sensor data uses vivid dotted lines so it is visually distinct.
+# Width of the live-sensor scrolling window in seconds.
+# Change this constant (or convert to a slider) to adjust the view width.
+LIVE_WINDOW_S = 20
+
+# Colour palettes — static data (CSV + recorded) uses vivid colours;
+# live sensor data uses grey semi-opaque lines (unrecorded, ephemeral).
 FILE_COLORS = [
     "#3b82f6", "#f97316", "#10b981", "#ef4444", "#8b5cf6",
     "#06b6d4", "#f59e0b", "#6366f1", "#84cc16", "#ec4899",
 ]
-LIVE_COLORS = [
-    "#ff006e", "#fb5607", "#ffbe0b", "#8338ec", "#3a86ff",
+# Distinct grey shades so multiple live sensors remain visually separable.
+LIVE_GREY_COLORS = [
+    "rgba(170,170,170,0.65)",
+    "rgba(100,100,100,0.65)",
+    "rgba(140,140,140,0.55)",
+    "rgba(70,70,70,0.65)",
 ]
 
 # Pre-compute stable colors for CSV runs and recorded sessions so that the
@@ -790,8 +798,7 @@ for row, unit in enumerate(unit_list, start=1):
                 line=dict(color=color, width=1.5),
             ), row=row, col=1)
 
-    # ── Live traces (dotted lines, vivid colors) ──────────────────────────────
-    # Ephemeral: only rendered while the sensor is actively connected.
+    # ── Live traces (grey semi-opaque — unrecorded, ephemeral) ───────────────
     addr_bufs = st.session_state.live_buffers.get(unit, {})
     for j, (addr, buf) in enumerate(addr_bufs.items()):
         if addr not in st.session_state.managed_addrs or not buf:
@@ -804,7 +811,7 @@ for row, unit in enumerate(unit_list, start=1):
             mode="lines",
             name=label,
             legend=legend_ref,
-            line=dict(color=LIVE_COLORS[j % len(LIVE_COLORS)], width=2, dash="dot"),
+            line=dict(color=LIVE_GREY_COLORS[j % len(LIVE_GREY_COLORS)], width=1.5),
         ), row=row, col=1)
 
     # ── Axis labels ───────────────────────────────────────────────────────────
@@ -820,6 +827,15 @@ for row, unit in enumerate(unit_list, start=1):
         showticklabels=True,  # show on every row (shared_xaxes hides non-bottom rows by default)
         **SPIKE, row=row, col=1,
     )
+
+# Find the latest timestamp across all live buffers for the scrolling window.
+_live_max_t: float | None = None
+for _l_unit, _l_bufs in st.session_state.live_buffers.items():
+    for _l_addr, _l_buf in _l_bufs.items():
+        if _l_addr in st.session_state.managed_addrs and _l_buf:
+            _t_last = list(_l_buf)[-1][0]
+            if _live_max_t is None or _t_last > _live_max_t:
+                _live_max_t = _t_last
 
 fig.update_layout(
     font=dict(family="Inter, sans-serif", size=13),
@@ -839,11 +855,19 @@ fig.update_layout(
     **legend_layout,
 )
 
-# Initialise the x-axis to 10 s on the very first render.  After that, uirevision
-# prevents Plotly.js from resetting whatever range the user has set.
-# shared_xaxes=True means this range applies to all subplots simultaneously.
-if not st.session_state.x_range_initialized:
-    fig.update_xaxes(range=[0, 10])
+# Live mode: keep the newest LIVE_WINDOW_S seconds visible, scrolling leftward.
+# Static mode (no live sensors): initialise to LIVE_WINDOW_S on first render,
+# then uirevision preserves whatever the user pans/zooms to.
+if _any_connected and _live_max_t is not None:
+    _x_end   = max(_live_max_t, LIVE_WINDOW_S)
+    _x_start = _x_end - LIVE_WINDOW_S
+    fig.update_xaxes(range=[_x_start, _x_end])
+    # Override xaxis.uirevision so Plotly.js always accepts the range update.
+    # The global uirevision="timeseries" still protects the y-axis zoom.
+    fig.layout.xaxis.uirevision = f"live_{_live_max_t}"
+    st.session_state.x_range_initialized = True
+elif not st.session_state.x_range_initialized:
+    fig.update_xaxes(range=[0, LIVE_WINDOW_S])
     st.session_state.x_range_initialized = True
 
 st.plotly_chart(fig, width="stretch", key="main_plot")
@@ -872,6 +896,6 @@ _sensors_transitioning = any(
 )
 _scan_active = PASCO_AVAILABLE and st.session_state.scan_state["in_progress"]
 
-if _scan_active or _sensors_transitioning or (_any_connected and st.session_state.recording):
+if _scan_active or _sensors_transitioning or _any_connected:
     time.sleep(0.3)
     st.rerun()
