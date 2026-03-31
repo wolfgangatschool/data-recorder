@@ -38,16 +38,11 @@
 - During recording the plot x-axis represents recording time (0 = recording start).
   The scrolling behaviour mirrors live mode: the newest recorded sample is always
   at the right edge and the window is `LIVE_WINDOW_S` wide.  While the recording
-  duration is shorter than `LIVE_WINDOW_S` the left portion of the window is empty
+  duration is shorter than `LIVE_WINDOW_S` the left portion of the window is still showing the data that was received before the recording starts
   (x < 0), but the first recorded sample still appears at the right edge — creating
-  a smooth transition from live to recording mode.  Once the duration exceeds
+  a smooth transition from live to recording mode.  Once the duration of the recording exceeds
   `LIVE_WINDOW_S` the window scrolls normally.
-- Live (grey) traces that predate the recording start are not shown during
-  recording; only live data arriving after Record was pressed appears on the same
-  0-based time axis.
-- When the recording stops, the x-axis is immediately zoomed to show the complete
-  session: `[0, recording_duration]`.  After that, if no live sensors are connected
-  the user can pan/zoom freely.
+- When the recording stops, the x-axis is immediately zoomed to show the complete session if `LIVE_WINDOW_S`<`recording_duration`: `[0, recording_duration]` and `LIVE_WINDOW_S` is set to `recording_duration`. if `LIVE_WINDOW_S`>=`recording_duration` the x-axis zoom is not changed by stopping the recording.
 - Every session is uniquely identified by the date-time stamp of its start.
 - A session captures one signal per sensor that was active at any point during the
   recording interval (sensors that disconnect mid-recording are captured up to the point of disconnection, sensors that are connected mid-recording are included in the recording with the first sample they send).
@@ -64,7 +59,7 @@
 - One subplot per physical unit (e.g. V, A); subplots share a common x-axis.
 - Subplots stacked vertically; each has its own legend and y-axis label.
 - Crosshair spike lines shown on hover across all subplots.
-- When no live sensors are connected, the user can pan/zoom freely and the view is preserved across plot refreshes.
+- The user can pan/zoom freely and the view is preserved across plot refreshes. Implementation Hint: This implies that `LIVE_WINDOW_S` must be adjusted according to pan/zoom actions by the user.
 
 ### Data Export
 - "Download CSV" link in the toolbar; active only when at least one recorded session exists or imported data is present.
