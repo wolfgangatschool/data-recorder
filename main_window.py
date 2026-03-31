@@ -335,13 +335,13 @@ class PlotPanel(QWidget):
         for p in self._plots.values():
             p.enableAutoRange(pg.ViewBox.YAxis, True)
 
-    def get_x_width(self) -> float | None:
-        """Return the current viewport x-axis width (reflects any user zoom)."""
+    def get_x_range(self) -> tuple[float, float] | None:
+        """Return (x_min, x_max) of the current viewport (reflects user zoom/pan)."""
         first = next(iter(self._plots.values()), None)
         if first is None:
             return None
         x_min, x_max = first.getViewBox().viewRange()[0]
-        return x_max - x_min
+        return (x_min, x_max)
 
     # ── Data update ───────────────────────────────────────────────────────────
 
@@ -841,9 +841,17 @@ class MainWindow(QMainWindow):
         #   • the user zooms the plot viewport (tracks user preference)
         self._live_window_s: float = LIVE_WINDOW_S
 
-        # Guard: skip viewport-width readback on the tick immediately after a
-        # plot rebuild (fresh ViewBox has an arbitrary default range).
-        self._plot_just_rebuilt: bool = False
+        # User pan/zoom state:
+        #   _center_offset — viewport centre relative to the natural anchor
+        #     (anchor = 0 when not recording; anchor = rec_duration when recording).
+        #     Updated whenever the user pans or zooms the plot.
+        #   _expected_x_range — the (x_start, x_end) we last programmatically set.
+        #     On the next tick we compare the actual viewport against this value.
+        #     If they differ the user interacted, and we update _live_window_s and
+        #     _center_offset accordingly.  Set to None after a plot rebuild so that
+        #     the fresh default ViewBox range is not mistaken for user interaction.
+        self._center_offset:    float = 0.0
+        self._expected_x_range: tuple[float, float] | None = None
 
         # ── Build UI ──────────────────────────────────────────────────────────
         self._build_toolbar()
@@ -993,21 +1001,27 @@ class MainWindow(QMainWindow):
         current_unit_list = list(self._plot_panel._plots.keys())
         if unit_list != current_unit_list:
             self._plot_panel.rebuild_for_units(unit_list)
-            self._plot_just_rebuilt = True
+            # Nullify expected range so the fresh default ViewBox range is not
+            # mistaken for user interaction on this tick.
+            self._expected_x_range = None
 
         if not unit_list:
-            self._plot_just_rebuilt = False
             return
 
-        # Sync _live_window_s with the user's current viewport zoom.
-        # Skipped on the tick immediately after a rebuild (stale default range)
-        # and when we are about to consume a post-stop range (we set the range,
-        # not the user).
-        if not self._plot_just_rebuilt and self._post_stop_duration is None:
-            w = self._plot_panel.get_x_width()
-            if w is not None and w > 1.0:   # ignore spurious sub-1 s ranges
-                self._live_window_s = w
-        self._plot_just_rebuilt = False
+        # Detect user zoom/pan: compare actual viewport against the range we last
+        # set programmatically.  Skip when _expected_x_range is None (just rebuilt
+        # or first tick) and when we are about to consume a post-stop range (the
+        # programmatic range we will set is not yet reflected in the viewport).
+        if self._expected_x_range is not None and self._post_stop_duration is None:
+            current = self._plot_panel.get_x_range()
+            if current is not None:
+                exp = self._expected_x_range
+                if abs(current[0] - exp[0]) > 0.01 or abs(current[1] - exp[1]) > 0.01:
+                    # User panned or zoomed: update window width and centre offset.
+                    self._live_window_s  = current[1] - current[0]
+                    anchor = (self._rec_ctrl.rec_duration
+                              if self._rec_ctrl.is_recording else 0.0)
+                    self._center_offset  = (current[0] + current[1]) / 2.0 - anchor
 
         # Update curves.
         self._plot_panel.update_curves(
@@ -1024,24 +1038,23 @@ class MainWindow(QMainWindow):
             in_progress_color_id = self._in_progress_color_id,
         )
 
-        # Set x-axis range.  Newest sample is always at the viewport centre.
+        # Set x-axis range.
+        # anchor + _center_offset = viewport centre; window = _live_window_s.
         half = self._live_window_s / 2
         if managed and self._plot_panel._plots:
-            if self._rec_ctrl.is_recording:
-                # Centre = newest recorded sample (x = dur).
-                # Left half shows recent history; right half is empty future.
-                # When dur < half the window extends into negative x, showing
-                # pre-recording live data there.
-                dur = self._rec_ctrl.rec_duration
-                self._plot_panel.set_x_range(dur - half, dur + half)
-            else:
-                # Centre = 0 (re-based latest sample).
-                # Left half: [-half, 0]; right half: [0, half] (empty future).
-                self._plot_panel.set_x_range(-half, half)
+            anchor = (self._rec_ctrl.rec_duration
+                      if self._rec_ctrl.is_recording else 0.0)
+            x_start = anchor + self._center_offset - half
+            x_end   = anchor + self._center_offset + half
+            self._plot_panel.set_x_range(x_start, x_end)
+            self._expected_x_range = (x_start, x_end)
         elif self._post_stop_duration is not None and self._plot_panel._plots:
             # Just stopped recording and recording was longer than window:
             # zoom to show the full session [0, recording_duration].
-            self._plot_panel.set_x_range(0.0, self._post_stop_duration)
+            x_start = 0.0
+            x_end   = self._post_stop_duration
+            self._plot_panel.set_x_range(x_start, x_end)
+            self._expected_x_range = (x_start, x_end)
             self._post_stop_duration = None   # consume — user pans freely after
 
     # ── Toolbar helpers ───────────────────────────────────────────────────────
@@ -1174,6 +1187,13 @@ class MainWindow(QMainWindow):
                 if final_dur > self._live_window_s:
                     self._live_window_s      = final_dur
                     self._post_stop_duration = final_dur
+                    # Anchor switches: rec_duration → 0.
+                    # Center for [0, final_dur] is at final_dur/2.
+                    self._center_offset      = final_dur / 2
+                else:
+                    # Viewport stays the same numerically; anchor switches from
+                    # final_dur to 0, so offset must absorb the old anchor value.
+                    self._center_offset      = final_dur + self._center_offset
             else:
                 # No data captured — discard the reserved color slot.
                 self._color_map.pop(self._in_progress_color_id or "", None)

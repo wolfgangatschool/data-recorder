@@ -229,25 +229,43 @@ can be added as a second export option later.
 Reduced from 15 s to **5 s** to meet the "sensors appear within ~5 s"
 discovery UX target.
 
-### x-axis rules and `_live_window_s` (implemented)
+### x-axis rules, `_live_window_s`, and `_center_offset` (implemented)
 
 `LIVE_WINDOW_S` in `data_store.py` is the compile-time default (20 s).
-`MainWindow._live_window_s` is the runtime effective width and is updated:
-- on every plot tick from the current PyQtGraph viewport width (user zoom is
-  automatically picked up between ticks)
-- when a recording stops and `final_dur > _live_window_s` (window grows to fit)
 
-| Mode | x range | Centre | `_live_window_s` change |
+**Runtime state in `MainWindow`:**
+
+| Field | Meaning | Initial value |
+|---|---|---|
+| `_live_window_s` | Current viewport width in seconds | `LIVE_WINDOW_S` |
+| `_center_offset` | User-chosen offset of the viewport centre from the natural anchor | `0.0` |
+
+**Natural anchor:** `0.0` when not recording; `rec_duration` when recording.
+**Viewport centre** = `anchor + _center_offset`.
+**Programmatic range** = `[anchor + _center_offset − W/2, anchor + _center_offset + W/2]`.
+
+**User pan/zoom detection:** each tick the programmatically set range is stored
+in `_expected_x_range`.  On the next tick the actual viewport is compared.  If
+they differ by more than 0.01 s, `_live_window_s` and `_center_offset` are
+updated from the actual viewport.  A plot rebuild sets `_expected_x_range = None`
+to avoid the fresh default ViewBox range being mistaken for user interaction.
+
+| Mode | x range | Anchor | `_center_offset` change |
 |---|---|---|---|
-| Live, not recording | `[−W/2, +W/2]` | 0 (latest sample) | synced from viewport each tick |
-| Recording | `[dur−W/2, dur+W/2]` | `dur` (newest recorded) | synced from viewport each tick |
-| Just stopped, `final_dur > W` | `[0, final_dur]` one tick | — | set to `final_dur` |
-| Just stopped, `final_dur ≤ W` | unchanged | — | unchanged |
-| No sensors | preserved (user pans freely) | — | synced from viewport each tick |
+| Live, not recording | `[−W/2+O, W/2+O]` | 0 | updated on user interaction |
+| Recording | `[dur−W/2+O, dur+W/2+O]` | `dur` | updated on user interaction |
+| Just stopped, `final_dur > W` | `[0, final_dur]` one tick | 0 | set to `final_dur/2` |
+| Just stopped, `final_dur ≤ W` | unchanged | 0 | set to `final_dur + O` (preserves x range) |
+| No sensors | preserved (user pans freely) | — | not changed programmatically |
 
-`W = _live_window_s`.  The right half of the viewport is always empty future
-space during live mode.  During recording, when `dur < W/2`, the left edge is
-negative (`dur − W/2 < 0`), showing pre-recording grey data there.
+`W = _live_window_s`, `O = _center_offset`.
+
+On recording stop the anchor switches from `rec_duration` to `0`.  `_center_offset`
+is adjusted to keep the viewport numerically unchanged: `O_new = final_dur + O_old`.
+When `final_dur > W`, the viewport zooms to `[0, final_dur]` and `O = final_dur/2`.
+
+During recording, when `dur < W/2 − O`, the left edge is negative, showing
+pre-recording grey data (smooth visual transition from live to recording mode).
 
 ---
 
