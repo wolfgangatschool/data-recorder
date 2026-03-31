@@ -20,6 +20,9 @@
 
 ### Sensor Status Display
 - Each connected sensor shows a status indicator: 🟢 connected / 🟡 transitioning / 🔴 error.
+- The sensor name in the connected list uses the format `<type> ᛒ <id>` (e.g., "Voltage ᛒ 390-900"),
+  where `ᛒ` is a Bluetooth symbol, `<type>` is the physical quantity (Voltage, Current, …),
+  and `<id>` is the sensor's hardware identifier (e.g., 390-900).
 - The disconnect button (－) is disabled while the sensor is disconnecting.
 - After a sensor disconnects (or errors), it is removed from the list and reappears in the dropdown.
 
@@ -76,6 +79,14 @@
 - Subplots stacked vertically; each has its own legend and y-axis label.
 - Crosshair spike lines shown on hover across all subplots.
 - The user can pan/zoom freely and the view is preserved across plot refreshes. Implementation Hint: This implies that `LIVE_WINDOW_S` must be adjusted according to pan/zoom actions by the user.
+- **Legend ordering**: the live (grey) signal entry for a unit appears first in that unit's legend,
+  before any recorded or imported traces.  If no sensor is currently connected for a unit, no
+  live-signal entry is shown in that unit's legend.
+- **Legend and axis font consistency**: axis tick labels and axis title labels use the same font
+  style (typeface and weight) as the legend text.  Font sizes of tick labels and axis titles are
+  unchanged.
+- **Live legend label format**: the live signal legend entry uses the same `<type> ᛒ <id>` format
+  as the connected-sensors list.
 
 ### Data Export
 - "Download CSV" link in the toolbar; active only when at least one recorded session exists or imported data is present.
@@ -289,6 +300,29 @@ branch is needed.
 
 During recording, when `dur < W/2 − O`, the left edge is negative, showing
 pre-recording grey data (smooth visual transition from live to recording mode).
+
+### Sensor label format and live-trace legend (implemented)
+
+**`SensorMeta.display_label`** (in `data_store.py`) returns `"{quantity} ᛒ {sensor_id}"`.
+This is used everywhere a human-readable sensor name is needed:
+- Connected-sensors list in `SensorPanel` (via `_on_status_changed` → `meta.display_label`)
+- Live (grey) trace legend entries in `PlotPanel.update_curves` (via `live_labels` dict built
+  in `_refresh_plot` and passed to `update_curves`)
+- Sensor dropdown (via `SensorMeta.display_label` directly)
+
+**Legend ordering:** `update_curves` adds curves in this order: live (grey) → in-progress
+(vivid) → recorded sessions → imported CSV.  Because PyQtGraph legend entries are appended
+on first `plot()` call and preserved on subsequent `setData()` calls, the order is set once
+per PlotItem lifetime (i.e., after every `rebuild_for_units`) and stays stable.
+
+**Legend cleanup:** stale curves (including their legend entries) are removed at the end
+of every `update_curves` call via `plot.removeItem()`, which also removes the legend entry
+automatically (PyQtGraph 0.13+).
+
+**Font consistency:** `rebuild_for_units` calls `QApplication.font()` to get the application
+default font and applies it to tick labels (`axis.setTickFont(font)`) and axis title labels
+(`axis.label.setFont(font)`) for both axes of every PlotItem.  The legend uses the same
+application default font by default, so all three text elements stay in sync.
 
 ---
 

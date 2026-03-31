@@ -298,6 +298,14 @@ class PlotPanel(QWidget):
             p.getAxis("left").setWidth(60)
             p.addLegend(offset=(5, 5))
 
+            # Apply a consistent font to axis tick labels and axis title labels
+            # so they match the legend typeface and weight.
+            app_font = QApplication.font()
+            for ax_name in ("left", "bottom"):
+                ax = p.getAxis(ax_name)
+                ax.setTickFont(app_font)
+                ax.label.setFont(app_font)
+
             vl = pg.InfiniteLine(
                 angle=90, movable=False,
                 pen=pg.mkPen((160, 160, 160, 120), width=0.8,
@@ -358,6 +366,7 @@ class PlotPanel(QWidget):
         in_progress_data:     dict | None = None,
         in_progress_labels:   dict[str, str] | None = None,
         in_progress_color_id: str | None = None,
+        live_labels:          dict[str, str] | None = None,
     ) -> None:
         """Refresh all visible curves with current data.
 
@@ -372,6 +381,7 @@ class PlotPanel(QWidget):
         in_progress_data     — {unit: {addr: [(t_rebased, v)]}} for the active recording
         in_progress_labels   — {addr: label} for sensors in the active recording
         in_progress_color_id — color_map key for the in-progress session
+        live_labels          — {addr: display_label} for live-trace legend entries
         """
         active_keys: set[str] = set()
         half = live_window_s / 2
@@ -407,9 +417,9 @@ class PlotPanel(QWidget):
                 xs   = [p[0] for p in pts]
                 ys   = [p[1] for p in pts]
                 if key not in self._curves:
-                    meta_label = addr[-6:]
+                    lv_lbl = (live_labels or {}).get(addr, addr[-6:])
                     self._curves[key] = self._plots[unit].plot(
-                        xs, ys, pen=pen, name=meta_label)
+                        xs, ys, pen=pen, name=lv_lbl)
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -1017,6 +1027,14 @@ class MainWindow(QMainWindow):
                               if self._rec_ctrl.is_recording else 0.0)
                     self._center_offset  = (current[0] + current[1]) / 2.0 - anchor
 
+        # Build live-trace display labels (addr → "Type ᛒ id") for the legend.
+        live_labels: dict[str, str] = {}
+        if self._ble:
+            for addr in managed:
+                meta = self._ble.get_meta(addr)
+                if meta:
+                    live_labels[addr] = meta.display_label
+
         # Update curves.
         self._plot_panel.update_curves(
             live_snapshot        = snapshot,
@@ -1030,6 +1048,7 @@ class MainWindow(QMainWindow):
             in_progress_data     = self._rec_ctrl.in_progress_data,
             in_progress_labels   = self._rec_ctrl.in_progress_labels,
             in_progress_color_id = self._in_progress_color_id,
+            live_labels          = live_labels,
         )
 
         # Set x-axis range whenever there are plots.
@@ -1119,8 +1138,9 @@ class MainWindow(QMainWindow):
         self._sensor_panel.set_available_sensors(available, managed)
 
     def _on_status_changed(self, addr: str, status: str) -> None:
-        label = (self._ble.get_label(addr) if self._ble else
-                 self._sensor_meta.get(addr, SensorMeta("?","","",addr)).quantity)
+        meta  = self._ble.get_meta(addr) if self._ble else None
+        label = (meta.display_label if meta else
+                 self._sensor_meta.get(addr, SensorMeta("?","","",addr)).display_label)
         self._sensor_panel.update_sensor_row(addr, status, label)
 
         if status == "removed":
