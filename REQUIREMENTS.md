@@ -150,13 +150,21 @@ BLE worker threads (one per active sensor + one for scanning)
 ├── Serialised through a single lock (one CoreBluetooth manager at a time)
 ├── Write only to LiveBuffer ring buffers
 └── Emit Qt signals → queued delivery to main thread
-      ScanComplete(list[SensorMeta])
-      StatusChanged(addr, Status)
-      DataReady(addr, unit, list[tuple[float, float]])
+      scan_started()
+      scan_complete(list[SensorMeta])
+      status_changed(addr, status)
+      unit_discovered(addr, unit)
 
-Plot timer (QTimer, 300 ms)
-└── Reads LiveBuffer snapshots and updates only the PlotPanel canvas
+Plot timer (QTimer, 333 ms ≈ 3 fps)
+├── Calls BLEManager.poll_cleanup()  — Phase 2 sensor removal
+├── Calls RecordingController.flush() — copy live → record buffers
+└── Reads LiveStore snapshots and updates only the PlotPanel canvas
 ```
+
+**No `DataReady` signal**: streaming threads write directly to `LiveBuffer`
+ring buffers; the plot timer pulls a snapshot on each tick. This avoids
+high-frequency signal emission (20 Hz × n sensors) and keeps inter-thread
+communication minimal.
 
 ### Extensibility points
 
@@ -175,19 +183,64 @@ Plot timer (QTimer, 300 ms)
 
 ---
 
+## Implementation notes (deviations from the architecture plan)
+
+### File structure
+
+The implemented layer structure maps to four files:
+
+| File | Role |
+|---|---|
+| `data_store.py` | Data layer — `LiveBuffer`, `LiveStore`, `SensorMeta`, `RecordingSession`, `ImportedRun` |
+| `ble_manager.py` | BLE layer — `BLEManager` (QObject with signals) |
+| `main_window.py` | Application + UI layers — `RecordingController`, `PlotPanel`, `SensorPanel`, `SessionPanel`, `MainWindow` |
+| `main.py` | Entry point |
+| `ble_patches.py` | macOS CoreBluetooth/pasco compatibility patches (unchanged) |
+
+The `AppController` / `SensorController` / `DataController` split from the
+architecture diagram was flattened: `RecordingController` is a standalone
+class in `main_window.py`; sensor connect/disconnect and CSV import/export
+are handled directly by `MainWindow` slots. For this application size this is
+cleaner than three thin controller classes with no meaningful state boundary.
+
+### PASCOAdapter
+
+Not a separate class. `ble_patches.py` continues to serve this role
+(monkey-patching the pasco library on import). A formal `SensorAdapter`
+abstract base class can be introduced when a second sensor type is needed.
+
+### CSV export format
+
+The export uses a **long/tidy** format (`source`, `label`, `time_s`, `value`,
+`unit`) rather than the wide per-sensor-column format described in the
+requirements. Reason: for sensors with different sampling rates, aligning rows
+by index into a wide format produces misleading implicit alignment. The tidy
+format is unambiguous and directly importable by pandas/R. The wide format
+can be added as a second export option later.
+
+### Scan interval
+
+Reduced from 15 s to **5 s** to meet the "sensors appear within ~5 s"
+discovery UX target.
+
+### x-axis during non-recording mode
+
+Implemented as specified: `[-LIVE_WINDOW_S, 0]` with the right edge fixed at
+0 (latest sample). Live data is re-based to `t − t_newest` so the newest
+point always maps to `x = 0`. During recording: `[max(0, duration − LIVE_WINDOW_S), duration]`.
+
+---
+
 ## Open Questions / To-Do
 
-1. **Migration scope**: decide whether to port the existing `ble_manager.py` and
-   `recording.py` logic incrementally into the new layer structure, or do a clean
-   rewrite. The BLE and recording logic is largely UI-agnostic already and can be
-   reused with minimal changes.
+1. **Faster sensor discovery**: investigate whether `pasco.scan()` accepts a
+   timeout argument shorter than its default, enabling tighter scan cycles
+   without the full ~5 s wait.
 
-2. **Faster sensor discovery**: investigate whether `pasco.scan()` accepts a timeout
-   argument shorter than its default, or whether the BLE scan can be run
-   continuously in the background rather than in periodic bursts.
+2. **y-axis zoom preservation during live streaming**: currently `set_x_range()`
+   re-enables y auto-range on every plot tick so y adapts to the visible window.
+   If the user manually zooms the y axis, that zoom is overridden on the next
+   tick. A future improvement: detect a user y-zoom gesture and stop overriding.
 
-3. **Time axis during mixed live + recorded display**: when live (grey) and recorded
-   (vivid) traces coexist on the plot, define the x-axis origin clearly — proposed
-   rule: during recording, x = 0 at recording start; after recording, x = 0 at the
-   start of the most recent session (or the earliest visible session), with live data
-   plotted on the same axis via a computed offset.
+3. **Analysis panel**: add a `QDockWidget` with fit controls (model selection,
+   parameter display) reading `SessionStore` via `scipy.optimize.curve_fit`.

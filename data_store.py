@@ -1,0 +1,176 @@
+"""
+Data layer: thread-safe buffers and in-memory stores.
+
+LIVE_WINDOW_S defines both the ring-buffer display window and the initial
+plot x-axis width.  Change this constant (or expose it as a UI slider later)
+to adjust how much live history is visible.
+"""
+
+import threading
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
+# Width of the live-sensor scrolling window in seconds.
+LIVE_WINDOW_S: float = 20.0
+
+
+# ── Sensor metadata ────────────────────────────────────────────────────────────
+
+@dataclass
+class SensorMeta:
+    quantity:   str
+    model:      str
+    sensor_id:  str
+    address:    str
+    ble_device: object = field(default=None, repr=False)
+
+    @property
+    def display_label(self) -> str:
+        return f"{self.quantity} ᛒ {self.sensor_id}"
+
+
+# ── Thread-safe per-sensor ring buffer ────────────────────────────────────────
+
+class LiveBuffer:
+    """Lock-protected ring buffer for a single sensor's time-series samples.
+
+    Background streaming threads call append(); the UI thread calls snapshot()
+    or last_t() for rendering.  The lock is held for the minimum duration.
+    """
+
+    MAXLEN = 20_000
+
+    def __init__(self) -> None:
+        self._buf: deque[tuple[float, float]] = deque(maxlen=self.MAXLEN)
+        self._lock = threading.Lock()
+
+    def append(self, t: float, v: float) -> None:
+        with self._lock:
+            self._buf.append((t, v))
+
+    def snapshot(self) -> list[tuple[float, float]]:
+        """Return a list copy; safe to call from any thread."""
+        with self._lock:
+            return list(self._buf)
+
+    def last_t(self) -> Optional[float]:
+        with self._lock:
+            return self._buf[-1][0] if self._buf else None
+
+    def clear(self) -> None:
+        with self._lock:
+            self._buf.clear()
+
+
+# ── Container for all active live buffers ─────────────────────────────────────
+
+class LiveStore:
+    """Holds all active live buffers keyed by (unit, address).
+
+    Background threads call get_or_create() once (during sensor setup) and
+    then call buf.append() directly.  The UI thread calls snapshot_all() or
+    max_t() from the plot-update timer — never holding the store lock during
+    a full render pass.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._buffers: dict[tuple[str, str], LiveBuffer] = {}
+
+    def get_or_create(self, unit: str, addr: str) -> LiveBuffer:
+        key = (unit, addr)
+        with self._lock:
+            if key not in self._buffers:
+                self._buffers[key] = LiveBuffer()
+            return self._buffers[key]
+
+    def remove_addr(self, addr: str) -> None:
+        with self._lock:
+            for key in [k for k in self._buffers if k[1] == addr]:
+                del self._buffers[key]
+
+    def units_for_addr(self, addr: str) -> list[str]:
+        with self._lock:
+            return [k[0] for k in self._buffers if k[1] == addr]
+
+    def active_units(self) -> set[str]:
+        with self._lock:
+            return {k[0] for k in self._buffers}
+
+    def active_addrs(self) -> set[str]:
+        with self._lock:
+            return {k[1] for k in self._buffers}
+
+    def snapshot_all(self) -> dict[str, dict[str, list[tuple[float, float]]]]:
+        """Return {unit: {addr: [(t, v)]}} for all buffers that have data."""
+        with self._lock:
+            keys = list(self._buffers.keys())
+        result: dict[str, dict[str, list]] = {}
+        for key in keys:
+            buf = self._buffers.get(key)
+            if buf is None:
+                continue
+            pts = buf.snapshot()
+            if pts:
+                unit, addr = key
+                result.setdefault(unit, {})[addr] = pts
+        return result
+
+    def max_t(self) -> Optional[float]:
+        """Latest timestamp across all buffers."""
+        with self._lock:
+            keys = list(self._buffers.keys())
+        t_max: Optional[float] = None
+        for key in keys:
+            buf = self._buffers.get(key)
+            if buf:
+                t = buf.last_t()
+                if t is not None and (t_max is None or t > t_max):
+                    t_max = t
+        return t_max
+
+
+# ── Finalised recording session ────────────────────────────────────────────────
+
+class RecordingSession:
+    """One completed recording session.
+
+    data          — {unit: {addr: [(t_rebased, v)]}}
+                    timestamps are re-based so the first sample is t=0
+    sensor_labels — {addr: display_label} cached at recording time so labels
+                    survive a disconnect before Stop is pressed
+    """
+
+    def __init__(
+        self,
+        label: str,
+        data: dict[str, dict[str, list[tuple[float, float]]]],
+        sensor_labels: dict[str, str],
+    ) -> None:
+        self.id            = str(id(self))
+        self.label         = label           # "HH:MM:SS, DD-MM-YY"
+        self.data          = data
+        self.sensor_labels = sensor_labels
+        self.visible: bool = True
+
+
+# ── Imported CSV run ───────────────────────────────────────────────────────────
+
+class ImportedRun:
+    """One run from an imported Pasco/SPARKvue CSV file.
+
+    data — {unit: {"times": [float], "values": [float]}}
+    """
+
+    def __init__(
+        self,
+        label: str,
+        run_num: int,
+        data: dict[str, dict[str, list]],
+    ) -> None:
+        self.id            = f"csv_{id(self)}"
+        self.label         = label       # e.g. "Run 1"
+        self.run_num       = run_num
+        self.data          = data
+        self.visible: bool = True

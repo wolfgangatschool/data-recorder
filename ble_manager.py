@@ -1,70 +1,77 @@
 """
-BLE sensor management: discovery, connection, streaming, and disconnection.
+BLE sensor management with Qt signal-based UI communication.
 
-All BLE operations are serialised via _ble_lock because macOS CoreBluetooth
-supports only one active CBCentralManager at a time.  Scan and connect must
-also run on the *same* PASCOBLEDevice instance so that the CBCentralManager
-and its asyncio event loop are shared.
+All BLE I/O is serialised via _ble_lock (one CoreBluetooth manager active at
+a time on macOS).  Background threads communicate with the UI exclusively by:
+  1. Emitting Qt signals (delivered to the main thread via Qt's queued event loop).
+  2. Writing to LiveBuffer objects (lock-protected ring buffers in data_store).
 
-Thread/main-thread communication
----------------------------------
-Three session-state structures are maintained:
+Background threads never touch any UI widget or Qt widget state directly.
 
-  managed_addrs : set[str]
-      Addresses currently in the sensor list.  Modified ONLY by on_click
-      callbacks on the main thread — never by background threads.  This is
-      the single source of truth for "is this sensor managed?".
+Thread model
+------------
+  Main thread  — creates BLEManager, calls connect_sensor / disconnect_sensor,
+                 calls poll_cleanup() from a QTimer.
+  Scan thread  — one at a time, acquires _ble_lock, emits scan_complete.
+  Connect thread (one per sensor)
+               — acquires _ble_lock (scan + connect), then streams until
+                 stop_event is set or sensor goes silent.
 
-  connections : dict[str, dict]
-      Per-connection details (status, label, unit, stop_event, …).
-      Each background thread receives the conn dict as a plain argument and
-      writes to it directly.  When _disconnect_sensor() pops the dict out of
-      connections, the thread still holds a reference to the now-orphaned dict
-      and may keep writing to it safely — those writes are invisible to the
-      main thread because the dict is no longer reachable from session_state.
-
-  sensor_meta : dict[str, dict]
-      Metadata cache: {addr: {quantity, model, sensor_id, address, ble_device}}.
-      Updated by the main thread from scan results and from connect metadata.
-      Used as a fallback in the dropdown for recently disconnected sensors
-      that have not yet been rediscovered by a scan.
-
-Background threads must never access st.session_state.
+Signal summary
+--------------
+  scan_started()                 — scan thread has been launched
+  scan_complete(list[SensorMeta])— results of the latest scan
+  status_changed(addr, status)   — lifecycle transitions:
+                                   "connecting…" | "connected" |
+                                   "disconnecting…" | "disconnected" |
+                                   "removed" | "error: <msg>"
+  unit_discovered(addr, unit)    — emitted once when the sensor's measurement
+                                   unit becomes known (after connect)
 """
 
 import threading
 import time
-from collections import deque
 
-import streamlit as st
-from pasco.pasco_ble_device import PASCOBLEDevice
+from PyQt6.QtCore import QObject, pyqtSignal
+
+try:
+    import ble_patches  # noqa: F401 — applies macOS pasco compatibility fixes
+    from pasco.pasco_ble_device import PASCOBLEDevice
+    PASCO_AVAILABLE = True
+except ImportError:
+    PASCO_AVAILABLE = False
+
+from data_store import LiveStore, SensorMeta
 
 
-# Serialise all BLE I/O — only one CBCentralManager may be active at a time.
+# ── Module-level BLE state ─────────────────────────────────────────────────────
+
+# Serialise all BLE I/O: only one CBCentralManager active at a time on macOS.
 _ble_lock = threading.Lock()
 
-# Strong reference so CoreBluetooth's delegate is not GC'd between callbacks.
+# Strong reference so the CBDelegate is not garbage-collected between callbacks.
 _scan_device_ref = None
 
-# Seconds between automatic background scans.
-SCAN_INTERVAL_S = 15
+# Seconds between automatic background scans in Live Discovery mode.
+# Target: a nearby sensor appears in the dropdown within ~5 s of being powered on.
+SCAN_INTERVAL_S: float = 5.0
 
-# Sensor considered lost after this many seconds of no data.
-STALE_TIMEOUT_S = 5
+# Sensor streaming considered stale after this many seconds of no data.
+STALE_TIMEOUT_S: float = 5.0
 
-# Shared time origin — set when the first sensor starts streaming.
-# Reset to None when all sensors are removed.
+# Shared time origin — set when the first sensor starts streaming;
+# reset to None when all sensors have been removed.
 _global_t0: float | None = None
 _t0_lock = threading.Lock()
 
 
 # ── Device metadata ────────────────────────────────────────────────────────────
 
-def _parse_ble_device(ble_device) -> dict:
+def _parse_ble_device(ble_device) -> SensorMeta:
     """Extract structured metadata from a raw BLEDevice returned by pasco.scan()."""
-    name    = (ble_device.name or "").split(">")[0].strip()
-    address = ble_device.address or ""
-    parts   = name.split()
+    name     = (ble_device.name or "").split(">")[0].strip()
+    address  = ble_device.address or ""
+    parts    = name.split()
     quantity = parts[0] if parts else "Sensor"
     if len(parts) >= 3:
         model, raw_id = parts[1], parts[2]
@@ -75,255 +82,258 @@ def _parse_ble_device(ble_device) -> dict:
         raw_id = address.replace("-", "")[-6:].upper()
     sensor_id = (f"{raw_id[:3]}-{raw_id[3:]}"
                  if len(raw_id) > 3 and "-" not in raw_id else raw_id)
-    return {
-        "quantity":   quantity,
-        "model":      model,
-        "sensor_id":  sensor_id,
-        "address":    address,
-        "ble_device": ble_device,
-    }
-
-
-def _sensor_display_label(entry: dict) -> str:
-    """Format a sensor entry as a human-readable dropdown label."""
-    return f"{entry['quantity']} ᛒ {entry['sensor_id']}"
-
-
-# ── Background scan ────────────────────────────────────────────────────────────
-
-def _do_scan(scan_state: dict) -> None:
-    """
-    Background thread: discover all available PASCO BLE sensors.
-
-    Writes only to scan_state (a plain dict passed as argument) — never to
-    st.session_state.  The main thread merges scan_state["results"] into
-    sensor_meta on each render.
-    """
-    global _scan_device_ref
-    with _ble_lock:
-        try:
-            device = PASCOBLEDevice()
-            _scan_device_ref = device
-            found = device.scan() or []
-        except Exception:
-            found = []
-
-    scan_state["results"]     = [_parse_ble_device(d) for d in found]
-    scan_state["in_progress"] = False
-    scan_state["last_time"]   = time.time()
-
-
-def _start_scan() -> None:
-    """Kick off a background scan if one is not already running."""
-    if st.session_state.scan_state["in_progress"]:
-        return
-    st.session_state.scan_state["in_progress"] = True
-    threading.Thread(
-        target=_do_scan,
-        args=(st.session_state.scan_state,),
-        daemon=True,
-    ).start()
-
-
-# ── Streaming ─────────────────────────────────────────────────────────────────
-
-def _stream_sensor(device, address: str, conn: dict, live_buffers: dict) -> None:
-    """
-    Poll a connected PASCOBLEDevice until conn["stop_event"] is set.
-
-    conn is a plain dict owned by this connection session.  All writes stay
-    within conn — st.session_state is never accessed from this thread.
-    """
-    try:
-        meas_list = device.get_measurement_list()
-        if not meas_list:
-            conn["status"] = "error: no measurements found"
-            device.disconnect()
-            return
-        meas_name = meas_list[0]
-
-        unit = None
-        for ch_measurements in device._device_measurements.values():
-            for m_attrs in ch_measurements.values():
-                if m_attrs.get("NameTag") == meas_name:
-                    unit = m_attrs.get("Units", "")
-                    break
-            if unit is not None:
-                break
-        if not unit:
-            unit = ("V" if "voltage" in meas_name.lower() else
-                    "A" if "current" in meas_name.lower() else meas_name)
-
-    except Exception as exc:
-        conn["status"] = f"error: {exc}"
-        try:
-            device.disconnect()
-        except Exception:
-            pass
-        return
-
-    live_buffers.setdefault(unit, {})
-    live_buffers[unit][address] = deque(maxlen=20_000)
-    buf = live_buffers[unit][address]
-    conn.update({"status": "connected", "unit": unit, "meas_name": meas_name})
-
-    global _global_t0
-    with _t0_lock:
-        if _global_t0 is None:
-            _global_t0 = time.time()
-        t0 = _global_t0
-
-    stop_event     = conn["stop_event"]
-    last_data_time = time.time()
-    while not stop_event.is_set():
-        try:
-            val = device.read_data(meas_name)
-            if val is not None:
-                buf.append((time.time() - t0, float(val)))
-                last_data_time = time.time()
-            elif time.time() - last_data_time > STALE_TIMEOUT_S:
-                break
-        except Exception:
-            break
-        time.sleep(0.05)
-
-    try:
-        device.disconnect()
-    except Exception:
-        pass
-    # Signal the main thread's safety sweep (runs on every rerun).
-    # This write goes to the conn dict; if _disconnect_sensor() already popped
-    # this dict from connections, the write is to an orphaned dict and is harmless.
-    conn["status"] = "disconnected"
-
-
-def _connect_thread_fn(address: str, conn: dict, live_buffers: dict) -> None:
-    """
-    Background thread: scan and connect using the same PASCOBLEDevice instance.
-    """
-    conn["status"] = "connecting…"
-    with _ble_lock:
-        if conn["stop_event"].is_set():
-            conn["status"] = "disconnected"
-            return
-        device = PASCOBLEDevice()
-        try:
-            found = device.scan() or []
-            match = next((d for d in found if d.address == address), None)
-            if match is None:
-                conn["status"] = "error: sensor not found (out of range?)"
-                return
-            device.connect(match)
-        except Exception as exc:
-            conn["status"] = f"error: {exc}"
-            return
-
-    if conn["stop_event"].is_set():
-        try:
-            device.disconnect()
-        except Exception:
-            pass
-        conn["status"] = "disconnected"
-        return
-
-    _stream_sensor(device, address, conn, live_buffers)
-
-
-# ── Connect / disconnect (called from main thread via on_click) ───────────────
-
-def _start_connect(entry: dict) -> None:
-    """
-    Add a sensor to the managed set and start a connection thread.
-
-    managed_addrs is the single source of truth.  Adding the address here
-    (before the next render) guarantees the sensor cannot appear in the
-    dropdown on the very next render — the dropdown filters by managed_addrs.
-
-    Guard: if the address is already in managed_addrs (e.g. rapid double-click),
-    this call is a no-op.
-    """
-    addr = entry["address"]
-
-    if addr in st.session_state.managed_addrs:
-        return  # guard: already managed — ignore duplicate
-
-    st.session_state.managed_addrs.add(addr)
-
-    # Cache metadata for display (sensor list + fallback dropdown).
-    st.session_state.sensor_meta[addr] = {
-        "quantity":  entry["quantity"],
-        "model":     entry["model"],
-        "sensor_id": entry["sensor_id"],
-        "address":   addr,
-        "ble_device": entry.get("ble_device"),
-    }
-
-    conn = {
-        "status":     "starting…",
-        "label":      entry["quantity"],
-        "unit":       None,
-        "meas_name":  None,
-        "stop_event": threading.Event(),
-        "thread":     None,
-    }
-    st.session_state.connections[addr] = conn
-
-    t = threading.Thread(
-        target=_connect_thread_fn,
-        args=(addr, conn, st.session_state.live_buffers),
-        daemon=True,
+    return SensorMeta(
+        quantity=quantity, model=model, sensor_id=sensor_id,
+        address=address, ble_device=ble_device,
     )
-    conn["thread"] = t
-    t.start()
 
 
-def _disconnect_sensor(address: str) -> None:
+# ── BLEManager ─────────────────────────────────────────────────────────────────
+
+class BLEManager(QObject):
+    """Manages BLE sensor discovery, connection, and data streaming.
+
+    All public methods must be called from the UI (main) thread.
+    Background threads communicate back via Qt signals, which Qt delivers to
+    connected slots on the main thread via the queued-connection mechanism.
     """
-    Two-phase removal of a sensor from the managed set.
 
-    Phase 1 — user clicks "－" (status is connected/connecting/starting):
-      Sets conn["status"] = "disconnecting…" and signals the thread to stop.
-      The address is intentionally kept in managed_addrs so the sensor remains
-      visible in the list (showing "disconnecting…") and stays out of the
-      dropdown until the thread actually finishes.
+    # Discovery
+    scan_started  = pyqtSignal()
+    scan_complete = pyqtSignal(list)        # list[SensorMeta]
 
-    Phase 2 — safety sweep (status == "disconnected") or error state:
-      Pops the conn dict, discards the address from managed_addrs, cleans up
-      live buffers, and resets the shared time origin if no sensors remain.
+    # Per-sensor lifecycle — status values documented in module docstring
+    status_changed  = pyqtSignal(str, str)  # addr, status
+    unit_discovered = pyqtSignal(str, str)  # addr, unit
 
-    Calling this function when conn is already gone (address not in connections)
-    is safe — it just ensures managed_addrs is clean.
-    """
-    conn = st.session_state.connections.get(address)
+    def __init__(self, live_store: LiveStore, parent=None) -> None:
+        super().__init__(parent)
+        self._live_store        = live_store
+        self._scan_in_progress  = False
+        self._scan_last_t: float = 0.0
+        # Per-address connection records (owned by the main thread).
+        # Background threads write only to conn["status"].
+        self._conns: dict[str, dict] = {}
+        self._managed_addrs: set[str] = set()
+        # Metadata cache so the sensor panel can display info after connection.
+        self._meta: dict[str, SensorMeta] = {}
 
-    if conn is None:
-        # Already fully removed; ensure managed_addrs is consistent.
-        st.session_state.managed_addrs.discard(address)
-        return
+    # ── Read-only properties ───────────────────────────────────────────────────
 
-    status = conn.get("status", "")
+    @property
+    def managed_addrs(self) -> frozenset[str]:
+        return frozenset(self._managed_addrs)
 
-    # ── Phase 2: complete removal ─────────────────────────────────────────────
-    if status == "disconnected" or status.startswith("error"):
-        st.session_state.connections.pop(address, None)
-        st.session_state.managed_addrs.discard(address)
-        for unit_bufs in list(st.session_state.live_buffers.values()):
-            unit_bufs.pop(address, None)
-        if address in st.session_state.sensor_meta:
-            st.session_state.sensor_meta[address]["_last_seen_at"] = time.time()
+    @property
+    def scan_in_progress(self) -> bool:
+        return self._scan_in_progress
+
+    @property
+    def scan_last_t(self) -> float:
+        return self._scan_last_t
+
+    def get_status(self, addr: str) -> str:
+        return self._conns.get(addr, {}).get("status", "")
+
+    def get_unit(self, addr: str) -> str | None:
+        return self._conns.get(addr, {}).get("unit")
+
+    def get_label(self, addr: str) -> str:
+        return self._conns.get(addr, {}).get("label", addr[-6:])
+
+    def get_meta(self, addr: str) -> SensorMeta | None:
+        return self._meta.get(addr)
+
+    # ── Public API (main thread only) ─────────────────────────────────────────
+
+    def start_scan(self) -> None:
+        """Kick off a background scan if one is not already running."""
+        if self._scan_in_progress:
+            return
+        self._scan_in_progress = True
+        self.scan_started.emit()
+        threading.Thread(target=self._do_scan, daemon=True).start()
+
+    def connect_sensor(self, meta: SensorMeta) -> None:
+        """Add a sensor to the managed set and start its connection thread."""
+        addr = meta.address
+        if addr in self._managed_addrs:
+            return
+        self._managed_addrs.add(addr)
+        self._meta[addr] = meta
+        conn = {
+            "status":     "starting…",
+            "stop_event": threading.Event(),
+            "thread":     None,
+            "unit":       None,
+            "label":      meta.quantity,
+        }
+        self._conns[addr] = conn
+        t = threading.Thread(
+            target=self._connect_thread_fn,
+            args=(meta, conn),
+            daemon=True,
+        )
+        conn["thread"] = t
+        t.start()
+        self.status_changed.emit(addr, "connecting…")
+
+    def disconnect_sensor(self, addr: str) -> None:
+        """Two-phase disconnect.
+
+        Phase 1 (this call): signal the streaming thread, keep addr in the
+        managed set so the UI still shows "disconnecting…" — not the dropdown.
+        Phase 2 (poll_cleanup): remove addr after the thread confirms it exited.
+        """
+        conn = self._conns.get(addr)
+        if conn is None:
+            self._managed_addrs.discard(addr)
+            return
+        status = conn.get("status", "")
+        if status == "disconnected" or status.startswith("error"):
+            self._cleanup(addr)
+            return
+        conn["status"] = "disconnecting…"
+        stop_evt = conn.get("stop_event")
+        if stop_evt:
+            stop_evt.set()
+        self._live_store.remove_addr(addr)
+        self.status_changed.emit(addr, "disconnecting…")
+
+    def poll_cleanup(self) -> None:
+        """Detect sensors whose threads have exited and complete Phase 2.
+
+        Must be called periodically from a UI-thread QTimer (e.g. every 300 ms).
+        """
+        for addr in list(self._managed_addrs):
+            status = self._conns.get(addr, {}).get("status", "")
+            if status == "disconnected" or status.startswith("error"):
+                self._cleanup(addr)
+
+    # ── Private helpers ────────────────────────────────────────────────────────
+
+    def _cleanup(self, addr: str) -> None:
+        """Phase 2: fully remove a sensor from the managed set."""
+        self._conns.pop(addr, None)
+        self._managed_addrs.discard(addr)
+        self._live_store.remove_addr(addr)
         global _global_t0
-        if not st.session_state.managed_addrs:
+        if not self._managed_addrs:
             with _t0_lock:
                 _global_t0 = None
-        return
+        self.status_changed.emit(addr, "removed")
 
-    # ── Phase 1: initiate graceful disconnect ─────────────────────────────────
-    # Signal the thread; managed_addrs is unchanged until Phase 2.
-    conn["status"] = "disconnecting…"
-    if conn.get("stop_event"):
-        conn["stop_event"].set()
-    # Drop the live buffer immediately — no new samples will be recorded.
-    for unit_bufs in list(st.session_state.live_buffers.values()):
-        unit_bufs.pop(address, None)
-    if address in st.session_state.sensor_meta:
-        st.session_state.sensor_meta[address]["_last_seen_at"] = time.time()
+    # ── Background threads ─────────────────────────────────────────────────────
+
+    def _do_scan(self) -> None:
+        """Background: scan for sensors and emit scan_complete."""
+        global _scan_device_ref
+        with _ble_lock:
+            try:
+                device       = PASCOBLEDevice()
+                _scan_device_ref = device
+                found        = device.scan() or []
+            except Exception:
+                found = []
+        results = [_parse_ble_device(d) for d in found]
+        self._scan_in_progress = False
+        self._scan_last_t      = time.time()
+        self.scan_complete.emit(results)   # delivered to main thread
+
+    def _connect_thread_fn(self, meta: SensorMeta, conn: dict) -> None:
+        """Background: scan again (to get a fresh CBPeripheral), connect, stream."""
+        conn["status"] = "connecting…"
+        with _ble_lock:
+            if conn["stop_event"].is_set():
+                conn["status"] = "disconnected"
+                return
+            device = PASCOBLEDevice()
+            try:
+                found = device.scan() or []
+                match = next((d for d in found if d.address == meta.address), None)
+                if match is None:
+                    conn["status"] = "error: sensor not found (out of range?)"
+                    self.status_changed.emit(meta.address, conn["status"])
+                    return
+                device.connect(match)
+            except Exception as exc:
+                conn["status"] = f"error: {exc}"
+                self.status_changed.emit(meta.address, conn["status"])
+                return
+
+        if conn["stop_event"].is_set():
+            try:
+                device.disconnect()
+            except Exception:
+                pass
+            conn["status"] = "disconnected"
+            return
+
+        self._stream_sensor(device, meta.address, conn)
+
+    def _stream_sensor(self, device, address: str, conn: dict) -> None:
+        """Background: read measurements in a loop until stop_event is set."""
+        # ── Discover measurement name and unit ────────────────────────────────
+        try:
+            meas_list = device.get_measurement_list()
+            if not meas_list:
+                conn["status"] = "error: no measurements found"
+                self.status_changed.emit(address, conn["status"])
+                device.disconnect()
+                return
+            meas_name = meas_list[0]
+
+            unit = None
+            for ch_m in device._device_measurements.values():
+                for m_attrs in ch_m.values():
+                    if m_attrs.get("NameTag") == meas_name:
+                        unit = m_attrs.get("Units", "")
+                        break
+                if unit is not None:
+                    break
+            if not unit:
+                unit = ("V" if "voltage" in meas_name.lower() else
+                        "A" if "current" in meas_name.lower() else meas_name)
+        except Exception as exc:
+            conn["status"] = f"error: {exc}"
+            self.status_changed.emit(address, conn["status"])
+            try:
+                device.disconnect()
+            except Exception:
+                pass
+            return
+
+        # ── Set up buffer and notify UI ───────────────────────────────────────
+        buf = self._live_store.get_or_create(unit, address)
+        conn.update({"status": "connected", "unit": unit})
+        self.status_changed.emit(address, "connected")
+        self.unit_discovered.emit(address, unit)
+
+        # ── Establish shared time origin ──────────────────────────────────────
+        global _global_t0
+        with _t0_lock:
+            if _global_t0 is None:
+                _global_t0 = time.time()
+            t0 = _global_t0
+
+        # ── Streaming loop ────────────────────────────────────────────────────
+        stop_event     = conn["stop_event"]
+        last_data_time = time.time()
+        while not stop_event.is_set():
+            try:
+                val = device.read_data(meas_name)
+                if val is not None:
+                    buf.append(time.time() - t0, float(val))
+                    last_data_time = time.time()
+                elif time.time() - last_data_time > STALE_TIMEOUT_S:
+                    break
+            except Exception:
+                break
+            time.sleep(0.05)
+
+        try:
+            device.disconnect()
+        except Exception:
+            pass
+        # Signal to poll_cleanup() on the main thread.
+        conn["status"] = "disconnected"
