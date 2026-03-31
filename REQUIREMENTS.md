@@ -35,9 +35,19 @@
 - "Record" button starts a recording session; "Stop" finalises it.
 - Only samples arriving after Record is pressed are captured.
 - The timestamp of the first recorded sample is **0**; all subsequent timestamps are in seconds relative to that first sample.
-- During recording the plot x-axis represents recording time (0 to current duration).
-  The right edge always shows the latest recorded sample. Live (grey) traces that predate the recording start are not shown during recording; only live data arriving
-  after Record was pressed appears (on the same 0-based time axis).
+- During recording the plot x-axis represents recording time (0 = recording start).
+  The scrolling behaviour mirrors live mode: the newest recorded sample is always
+  at the right edge and the window is `LIVE_WINDOW_S` wide.  While the recording
+  duration is shorter than `LIVE_WINDOW_S` the left portion of the window is empty
+  (x < 0), but the first recorded sample still appears at the right edge — creating
+  a smooth transition from live to recording mode.  Once the duration exceeds
+  `LIVE_WINDOW_S` the window scrolls normally.
+- Live (grey) traces that predate the recording start are not shown during
+  recording; only live data arriving after Record was pressed appears on the same
+  0-based time axis.
+- When the recording stops, the x-axis is immediately zoomed to show the complete
+  session: `[0, recording_duration]`.  After that, if no live sensors are connected
+  the user can pan/zoom freely.
 - Every session is uniquely identified by the date-time stamp of its start.
 - A session captures one signal per sensor that was active at any point during the
   recording interval (sensors that disconnect mid-recording are captured up to the point of disconnection, sensors that are connected mid-recording are included in the recording with the first sample they send).
@@ -223,11 +233,18 @@ can be added as a second export option later.
 Reduced from 15 s to **5 s** to meet the "sensors appear within ~5 s"
 discovery UX target.
 
-### x-axis during non-recording mode
+### x-axis rules (implemented)
 
-Implemented as specified: `[-LIVE_WINDOW_S, 0]` with the right edge fixed at
-0 (latest sample). Live data is re-based to `t − t_newest` so the newest
-point always maps to `x = 0`. During recording: `[max(0, duration − LIVE_WINDOW_S), duration]`.
+| Mode | x range | Right edge |
+|---|---|---|
+| Live, not recording | `[−LIVE_WINDOW_S, 0]` | fixed at 0 (latest sample) |
+| Recording | `[dur − LIVE_WINDOW_S, dur]` | latest recorded sample |
+| Just stopped (one tick) | `[0, final_dur]` | full session visible |
+| No sensors, after stop | preserved (user pan/zoom) | — |
+
+During recording, `dur − LIVE_WINDOW_S` is negative while `dur < LIVE_WINDOW_S`;
+PyQtGraph renders it as empty space, which is the intended "first sample at the
+right edge" feel.
 
 ---
 

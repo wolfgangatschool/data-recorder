@@ -773,6 +773,12 @@ class MainWindow(QMainWindow):
         # ── Live Discovery state ───────────────────────────────────────────────
         self._live_discovery: bool = True
 
+        # ── Post-recording one-time x-range initialisation ────────────────────
+        # Set to the final recording duration when Stop is pressed; consumed
+        # on the next plot tick to zoom the x-axis to [0, duration].  Cleared
+        # immediately after use so subsequent user pan/zoom is not overridden.
+        self._post_stop_duration: float | None = None
+
         # ── Build UI ──────────────────────────────────────────────────────────
         self._build_toolbar()
         self._build_sidebar()
@@ -936,18 +942,23 @@ class MainWindow(QMainWindow):
             rec_start_abs  = self._rec_ctrl.rec_start_abs,
         )
 
-        # Set x-axis range when sensors are connected.
+        # Set x-axis range.
         if managed and self._plot_panel._plots:
             if self._rec_ctrl.is_recording:
-                dur = self._rec_ctrl.rec_duration
-                x_end   = max(dur, LIVE_WINDOW_S)
-                x_start = x_end - LIVE_WINDOW_S
-                self._plot_panel.set_x_range(max(0.0, x_start), x_end)
+                # Newest recorded sample always at right edge; window is
+                # LIVE_WINDOW_S wide.  When dur < LIVE_WINDOW_S the left side
+                # of the window is empty (x < 0) — matching live-mode feel.
+                dur   = self._rec_ctrl.rec_duration
+                x_end = dur
+                self._plot_panel.set_x_range(x_end - LIVE_WINDOW_S, x_end)
             else:
-                # Not recording: right edge = 0, left edge = -LIVE_WINDOW_S.
+                # Live, not recording: right edge = 0 (latest sample),
+                # left edge = -LIVE_WINDOW_S.
                 self._plot_panel.set_x_range(-LIVE_WINDOW_S, 0.0)
-        elif not managed and not self._plot_panel._plots:
-            pass  # nothing to show
+        elif self._post_stop_duration is not None and self._plot_panel._plots:
+            # Just stopped recording: zoom x to show the full session [0, dur].
+            self._plot_panel.set_x_range(0.0, self._post_stop_duration)
+            self._post_stop_duration = None   # consume — user may pan freely after
 
     # ── Toolbar helpers ───────────────────────────────────────────────────────
 
@@ -1064,13 +1075,18 @@ class MainWindow(QMainWindow):
 
     def _on_record_stop(self) -> None:
         if self._rec_ctrl.is_recording:
-            session = self._rec_ctrl.stop()
+            # Capture duration before stop() clears the in-progress buffers.
+            final_dur = self._rec_ctrl.rec_duration
+            session   = self._rec_ctrl.stop()
             if session:
                 self._assign_color(session.id)
                 self._session_panel.add_entry(
                     session.id, session.label,
                     on_toggle=self._on_toggle_session,
                 )
+                # Schedule a one-time x-range reset on the next plot tick so
+                # the full recording [0, duration] is immediately visible.
+                self._post_stop_duration = max(final_dur, 1.0)
             self._update_download_btn()
         else:
             self._rec_ctrl.start()
