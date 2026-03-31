@@ -119,6 +119,16 @@ class RecordingController:
     def rec_start_abs(self) -> float | None:
         return self._rec_start_abs
 
+    @property
+    def in_progress_data(self) -> dict[str, dict[str, list[tuple[float, float]]]] | None:
+        """In-progress {unit: {addr: [(t_rebased, v)]}} or None when not recording."""
+        return self._record_data if self.is_recording else None
+
+    @property
+    def in_progress_labels(self) -> dict[str, str]:
+        """Sensor display labels accumulated so far during the active recording."""
+        return dict(self._sensor_labels) if self.is_recording else {}
+
     def total_points(self) -> int:
         return sum(
             len(pts)
@@ -325,31 +335,48 @@ class PlotPanel(QWidget):
         for p in self._plots.values():
             p.enableAutoRange(pg.ViewBox.YAxis, True)
 
+    def get_x_width(self) -> float | None:
+        """Return the current viewport x-axis width (reflects any user zoom)."""
+        first = next(iter(self._plots.values()), None)
+        if first is None:
+            return None
+        x_min, x_max = first.getViewBox().viewRange()[0]
+        return x_max - x_min
+
     # ── Data update ───────────────────────────────────────────────────────────
 
     def update_curves(
         self,
-        live_snapshot:   dict[str, dict[str, list[tuple[float, float]]]],
-        sessions:        list[RecordingSession],
-        imported_runs:   list[ImportedRun],
-        managed_addrs:   frozenset[str],
-        color_map:       dict[str, tuple[int, int, int]],
-        is_recording:    bool,
-        rec_start_abs:   float | None,
+        live_snapshot:        dict[str, dict[str, list[tuple[float, float]]]],
+        sessions:             list[RecordingSession],
+        imported_runs:        list[ImportedRun],
+        managed_addrs:        frozenset[str],
+        color_map:            dict[str, tuple[int, int, int]],
+        is_recording:         bool,
+        rec_start_abs:        float | None,
+        live_window_s:        float = LIVE_WINDOW_S,
+        in_progress_data:     dict | None = None,
+        in_progress_labels:   dict[str, str] | None = None,
+        in_progress_color_id: str | None = None,
     ) -> None:
         """Refresh all visible curves with current data.
 
-        live_snapshot  — snapshot from LiveStore.snapshot_all()
-        sessions       — RecordingSession list (all; visibility filtered here)
-        imported_runs  — ImportedRun list (all; visibility filtered here)
-        managed_addrs  — currently connected sensor addresses
-        color_map      — id → (r,g,b) for sessions and runs
-        is_recording   — True during an active recording
-        rec_start_abs  — absolute t (LiveBuffer time base) of first recorded sample
+        live_snapshot        — snapshot from LiveStore.snapshot_all()
+        sessions             — RecordingSession list (all; visibility filtered here)
+        imported_runs        — ImportedRun list (all; visibility filtered here)
+        managed_addrs        — currently connected sensor addresses
+        color_map            — id → (r,g,b) for sessions and runs
+        is_recording         — True during an active recording
+        rec_start_abs        — absolute t (LiveBuffer time base) of first recorded sample
+        live_window_s        — current effective window width
+        in_progress_data     — {unit: {addr: [(t_rebased, v)]}} for the active recording
+        in_progress_labels   — {addr: label} for sensors in the active recording
+        in_progress_color_id — color_map key for the in-progress session
         """
         active_keys: set[str] = set()
+        half = live_window_s / 2
 
-        # ── Live (grey) traces ─────────────────────────────────────────────────
+        # ── Live (grey) traces — pre-recording history only ────────────────────
         for j, addr in enumerate(sorted(managed_addrs)):
             for unit, addr_map in live_snapshot.items():
                 if unit not in self._plots:
@@ -359,14 +386,16 @@ class PlotPanel(QWidget):
                     continue
 
                 if is_recording and rec_start_abs is not None:
-                    # Show only data since recording start, re-based to t=0.
+                    # Only show the pre-recording portion (x < 0).
+                    # Recorded data (x ≥ 0) is drawn as the vivid in-progress trace.
                     pts = [(t - rec_start_abs, v)
-                           for t, v in pts if t >= rec_start_abs]
+                           for t, v in pts
+                           if t >= rec_start_abs - half and t < rec_start_abs]
                 else:
-                    # Re-base so newest sample → 0, oldest visible → -LIVE_WINDOW_S.
+                    # Re-base so newest sample → 0 (centre of viewport).
                     t_newest = pts[-1][0]
                     pts = [(t - t_newest, v) for t, v in pts
-                           if t >= t_newest - LIVE_WINDOW_S]
+                           if t >= t_newest - half]
 
                 if not pts:
                     continue
@@ -384,6 +413,29 @@ class PlotPanel(QWidget):
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
+
+        # ── In-progress recording trace (vivid, pre-assigned color) ──────────────
+        if in_progress_data and in_progress_color_id:
+            color = color_map.get(in_progress_color_id, FILE_COLORS[0])
+            pen   = pg.mkPen(color=color, width=1.5)
+            labels = in_progress_labels or {}
+            for unit, sensor_map in in_progress_data.items():
+                if unit not in self._plots:
+                    continue
+                for addr, pts in sensor_map.items():
+                    if not pts:
+                        continue
+                    lbl = labels.get(addr, addr[-6:])
+                    key = f"inprog|{unit}|{addr}"
+                    active_keys.add(key)
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    if key not in self._curves:
+                        self._curves[key] = self._plots[unit].plot(
+                            xs, ys, pen=pen, name=lbl)
+                    else:
+                        self._curves[key].setData(xs, ys)
+                        self._curves[key].setPen(pen)
 
         # ── Recorded session traces (vivid) ────────────────────────────────────
         for session in sessions:
@@ -773,11 +825,25 @@ class MainWindow(QMainWindow):
         # ── Live Discovery state ───────────────────────────────────────────────
         self._live_discovery: bool = True
 
+        # ── In-progress recording color ───────────────────────────────────────
+        # Set to "rec_in_progress" when recording starts; transferred to the
+        # session id on Stop so the color stays stable across the transition.
+        self._in_progress_color_id: str | None = None
+
         # ── Post-recording one-time x-range initialisation ────────────────────
-        # Set to the final recording duration when Stop is pressed; consumed
-        # on the next plot tick to zoom the x-axis to [0, duration].  Cleared
-        # immediately after use so subsequent user pan/zoom is not overridden.
+        # Set to final recording duration when Stop is pressed (only when that
+        # duration exceeds the current window); consumed on next tick.
         self._post_stop_duration: float | None = None
+
+        # ── Effective live window width ────────────────────────────────────────
+        # Initialised from the module constant; updated when:
+        #   • a recording longer than the current window finishes (grows to fit)
+        #   • the user zooms the plot viewport (tracks user preference)
+        self._live_window_s: float = LIVE_WINDOW_S
+
+        # Guard: skip viewport-width readback on the tick immediately after a
+        # plot rebuild (fresh ViewBox has an arbitrary default range).
+        self._plot_just_rebuilt: bool = False
 
         # ── Build UI ──────────────────────────────────────────────────────────
         self._build_toolbar()
@@ -927,38 +993,56 @@ class MainWindow(QMainWindow):
         current_unit_list = list(self._plot_panel._plots.keys())
         if unit_list != current_unit_list:
             self._plot_panel.rebuild_for_units(unit_list)
+            self._plot_just_rebuilt = True
 
         if not unit_list:
+            self._plot_just_rebuilt = False
             return
+
+        # Sync _live_window_s with the user's current viewport zoom.
+        # Skipped on the tick immediately after a rebuild (stale default range)
+        # and when we are about to consume a post-stop range (we set the range,
+        # not the user).
+        if not self._plot_just_rebuilt and self._post_stop_duration is None:
+            w = self._plot_panel.get_x_width()
+            if w is not None and w > 1.0:   # ignore spurious sub-1 s ranges
+                self._live_window_s = w
+        self._plot_just_rebuilt = False
 
         # Update curves.
         self._plot_panel.update_curves(
-            live_snapshot  = snapshot,
-            sessions       = self._rec_ctrl.sessions,
-            imported_runs  = self._imported_runs,
-            managed_addrs  = managed,
-            color_map      = self._color_map,
-            is_recording   = self._rec_ctrl.is_recording,
-            rec_start_abs  = self._rec_ctrl.rec_start_abs,
+            live_snapshot        = snapshot,
+            sessions             = self._rec_ctrl.sessions,
+            imported_runs        = self._imported_runs,
+            managed_addrs        = managed,
+            color_map            = self._color_map,
+            is_recording         = self._rec_ctrl.is_recording,
+            rec_start_abs        = self._rec_ctrl.rec_start_abs,
+            live_window_s        = self._live_window_s,
+            in_progress_data     = self._rec_ctrl.in_progress_data,
+            in_progress_labels   = self._rec_ctrl.in_progress_labels,
+            in_progress_color_id = self._in_progress_color_id,
         )
 
-        # Set x-axis range.
+        # Set x-axis range.  Newest sample is always at the viewport centre.
+        half = self._live_window_s / 2
         if managed and self._plot_panel._plots:
             if self._rec_ctrl.is_recording:
-                # Newest recorded sample always at right edge; window is
-                # LIVE_WINDOW_S wide.  When dur < LIVE_WINDOW_S the left side
-                # of the window is empty (x < 0) — matching live-mode feel.
-                dur   = self._rec_ctrl.rec_duration
-                x_end = dur
-                self._plot_panel.set_x_range(x_end - LIVE_WINDOW_S, x_end)
+                # Centre = newest recorded sample (x = dur).
+                # Left half shows recent history; right half is empty future.
+                # When dur < half the window extends into negative x, showing
+                # pre-recording live data there.
+                dur = self._rec_ctrl.rec_duration
+                self._plot_panel.set_x_range(dur - half, dur + half)
             else:
-                # Live, not recording: right edge = 0 (latest sample),
-                # left edge = -LIVE_WINDOW_S.
-                self._plot_panel.set_x_range(-LIVE_WINDOW_S, 0.0)
+                # Centre = 0 (re-based latest sample).
+                # Left half: [-half, 0]; right half: [0, half] (empty future).
+                self._plot_panel.set_x_range(-half, half)
         elif self._post_stop_duration is not None and self._plot_panel._plots:
-            # Just stopped recording: zoom x to show the full session [0, dur].
+            # Just stopped recording and recording was longer than window:
+            # zoom to show the full session [0, recording_duration].
             self._plot_panel.set_x_range(0.0, self._post_stop_duration)
-            self._post_stop_duration = None   # consume — user may pan freely after
+            self._post_stop_duration = None   # consume — user pans freely after
 
     # ── Toolbar helpers ───────────────────────────────────────────────────────
 
@@ -1079,16 +1163,26 @@ class MainWindow(QMainWindow):
             final_dur = self._rec_ctrl.rec_duration
             session   = self._rec_ctrl.stop()
             if session:
-                self._assign_color(session.id)
+                # Transfer the pre-assigned color to the finalised session id.
+                cid = self._in_progress_color_id or "rec_in_progress"
+                self._color_map[session.id] = self._color_map.pop(cid, FILE_COLORS[0])
+                self._in_progress_color_id  = None
                 self._session_panel.add_entry(
                     session.id, session.label,
                     on_toggle=self._on_toggle_session,
                 )
-                # Schedule a one-time x-range reset on the next plot tick so
-                # the full recording [0, duration] is immediately visible.
-                self._post_stop_duration = max(final_dur, 1.0)
+                if final_dur > self._live_window_s:
+                    self._live_window_s      = final_dur
+                    self._post_stop_duration = final_dur
+            else:
+                # No data captured — discard the reserved color slot.
+                self._color_map.pop(self._in_progress_color_id or "", None)
+                self._in_progress_color_id = None
             self._update_download_btn()
         else:
+            # Pre-assign the color this session will use when finalised.
+            self._in_progress_color_id = "rec_in_progress"
+            self._assign_color(self._in_progress_color_id)
             self._rec_ctrl.start()
 
     def _on_toggle_session(self, session_id: str, visible: bool) -> None:

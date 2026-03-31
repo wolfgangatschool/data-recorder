@@ -26,22 +26,23 @@
 ### Live Data Streaming
 - Connected sensors stream data continuously; only the most recent `LIVE_WINDOW_S` seconds of live data are retained and displayed.
 - Live (unrecorded) signal is shown in the plot as **grey, semi-opaque** lines.
-- The plot window is fixed at `LIVE_WINDOW_S` wide (default 20 s), scrolling so the newest sample is always at the right edge.
-- When **not recording**, the time axis shows the time range `(-LIVE_WINDOW_S, 0)`, i.e.:
-  the right edge of the time axis is always `0s` and aligned with the latest sample
-  the left edge of the axis is `−LIVE_WINDOW_S`.
+- The plot window is `LIVE_WINDOW_S` wide (default 20 s). The newest sample is
+  always at the **centre** of the plot. The right half `[0, LIVE_WINDOW_S/2]` shows
+  empty future space; the left half `[-LIVE_WINDOW_S/2, 0]` shows recent history.
+- When **not recording**, the time axis shows `(-LIVE_WINDOW_S/2, +LIVE_WINDOW_S/2)`,
+  with `0s` (latest sample) fixed at the centre.
 
 ### Recording
 - "Record" button starts a recording session; "Stop" finalises it.
 - Only samples arriving after Record is pressed are captured.
 - The timestamp of the first recorded sample is **0**; all subsequent timestamps are in seconds relative to that first sample.
 - During recording the plot x-axis represents recording time (0 = recording start).
-  The scrolling behaviour mirrors live mode: the newest recorded sample is always
-  at the right edge and the window is `LIVE_WINDOW_S` wide.  While the recording
-  duration is shorter than `LIVE_WINDOW_S` the left portion of the window is still showing the data that was received before the recording starts
-  (x < 0), but the first recorded sample still appears at the right edge — creating
-  a smooth transition from live to recording mode.  Once the duration of the recording exceeds
-  `LIVE_WINDOW_S` the window scrolls normally.
+  The newest recorded sample is always at the **centre** of the viewport, mirroring
+  live mode. The viewport is `LIVE_WINDOW_S` wide: left half shows recent history,
+  right half shows empty future space.  While the recording duration is shorter than
+  `LIVE_WINDOW_S/2` the left edge is negative, showing pre-recording live data there —
+  creating a smooth transition from live to recording mode.  Once `dur > LIVE_WINDOW_S/2`
+  the window scrolls normally with the newest sample at the centre.
 - When the recording stops, the x-axis is immediately zoomed to show the complete session if `LIVE_WINDOW_S`<`recording_duration`: `[0, recording_duration]` and `LIVE_WINDOW_S` is set to `recording_duration`. if `LIVE_WINDOW_S`>=`recording_duration` the x-axis zoom is not changed by stopping the recording.
 - Every session is uniquely identified by the date-time stamp of its start.
 - A session captures one signal per sensor that was active at any point during the
@@ -228,18 +229,25 @@ can be added as a second export option later.
 Reduced from 15 s to **5 s** to meet the "sensors appear within ~5 s"
 discovery UX target.
 
-### x-axis rules (implemented)
+### x-axis rules and `_live_window_s` (implemented)
 
-| Mode | x range | Right edge |
-|---|---|---|
-| Live, not recording | `[−LIVE_WINDOW_S, 0]` | fixed at 0 (latest sample) |
-| Recording | `[dur − LIVE_WINDOW_S, dur]` | latest recorded sample |
-| Just stopped (one tick) | `[0, final_dur]` | full session visible |
-| No sensors, after stop | preserved (user pan/zoom) | — |
+`LIVE_WINDOW_S` in `data_store.py` is the compile-time default (20 s).
+`MainWindow._live_window_s` is the runtime effective width and is updated:
+- on every plot tick from the current PyQtGraph viewport width (user zoom is
+  automatically picked up between ticks)
+- when a recording stops and `final_dur > _live_window_s` (window grows to fit)
 
-During recording, `dur − LIVE_WINDOW_S` is negative while `dur < LIVE_WINDOW_S`;
-PyQtGraph renders it as empty space, which is the intended "first sample at the
-right edge" feel.
+| Mode | x range | Centre | `_live_window_s` change |
+|---|---|---|---|
+| Live, not recording | `[−W/2, +W/2]` | 0 (latest sample) | synced from viewport each tick |
+| Recording | `[dur−W/2, dur+W/2]` | `dur` (newest recorded) | synced from viewport each tick |
+| Just stopped, `final_dur > W` | `[0, final_dur]` one tick | — | set to `final_dur` |
+| Just stopped, `final_dur ≤ W` | unchanged | — | unchanged |
+| No sensors | preserved (user pans freely) | — | synced from viewport each tick |
+
+`W = _live_window_s`.  The right half of the viewport is always empty future
+space during live mode.  During recording, when `dur < W/2`, the left edge is
+negative (`dur − W/2 < 0`), showing pre-recording grey data there.
 
 ---
 
