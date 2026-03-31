@@ -1143,8 +1143,9 @@ class MainWindow(QMainWindow):
                  self._sensor_meta.get(addr, SensorMeta("?","","",addr)).display_label)
         self._sensor_panel.update_sensor_row(addr, status, label)
 
-        if status == "removed":
-            # Re-populate dropdown now that the sensor is fully gone.
+        if status in ("connecting…", "removed"):
+            # Refresh the dropdown whenever a sensor enters or leaves the managed
+            # set so it never appears in both the dropdown and the connected list.
             managed  = self._ble.managed_addrs if self._ble else frozenset()
             available = [m for m in self._sensor_meta.values()
                          if m.address not in managed]
