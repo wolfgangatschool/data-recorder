@@ -830,11 +830,6 @@ class MainWindow(QMainWindow):
         # session id on Stop so the color stays stable across the transition.
         self._in_progress_color_id: str | None = None
 
-        # ── Post-recording one-time x-range initialisation ────────────────────
-        # Set to final recording duration when Stop is pressed (only when that
-        # duration exceeds the current window); consumed on next tick.
-        self._post_stop_duration: float | None = None
-
         # ── Effective live window width ────────────────────────────────────────
         # Initialised from the module constant; updated when:
         #   • a recording longer than the current window finishes (grows to fit)
@@ -1010,9 +1005,8 @@ class MainWindow(QMainWindow):
 
         # Detect user zoom/pan: compare actual viewport against the range we last
         # set programmatically.  Skip when _expected_x_range is None (just rebuilt
-        # or first tick) and when we are about to consume a post-stop range (the
-        # programmatic range we will set is not yet reflected in the viewport).
-        if self._expected_x_range is not None and self._post_stop_duration is None:
+        # or first tick after recording stop).
+        if self._expected_x_range is not None:
             current = self._plot_panel.get_x_range()
             if current is not None:
                 exp = self._expected_x_range
@@ -1038,24 +1032,17 @@ class MainWindow(QMainWindow):
             in_progress_color_id = self._in_progress_color_id,
         )
 
-        # Set x-axis range.
-        # anchor + _center_offset = viewport centre; window = _live_window_s.
-        half = self._live_window_s / 2
-        if managed and self._plot_panel._plots:
+        # Set x-axis range whenever there are plots.
+        # Formula: [anchor + O − half, anchor + O + half]
+        # where anchor = rec_duration while recording, 0 otherwise.
+        if self._plot_panel._plots:
+            half   = self._live_window_s / 2
             anchor = (self._rec_ctrl.rec_duration
                       if self._rec_ctrl.is_recording else 0.0)
             x_start = anchor + self._center_offset - half
             x_end   = anchor + self._center_offset + half
             self._plot_panel.set_x_range(x_start, x_end)
             self._expected_x_range = (x_start, x_end)
-        elif self._post_stop_duration is not None and self._plot_panel._plots:
-            # Just stopped recording and recording was longer than window:
-            # zoom to show the full session [0, recording_duration].
-            x_start = 0.0
-            x_end   = self._post_stop_duration
-            self._plot_panel.set_x_range(x_start, x_end)
-            self._expected_x_range = (x_start, x_end)
-            self._post_stop_duration = None   # consume — user pans freely after
 
     # ── Toolbar helpers ───────────────────────────────────────────────────────
 
@@ -1184,16 +1171,16 @@ class MainWindow(QMainWindow):
                     session.id, session.label,
                     on_toggle=self._on_toggle_session,
                 )
-                if final_dur > self._live_window_s:
-                    self._live_window_s      = final_dur
-                    self._post_stop_duration = final_dur
-                    # Anchor switches: rec_duration → 0.
-                    # Center for [0, final_dur] is at final_dur/2.
-                    self._center_offset      = final_dur / 2
-                else:
-                    # Viewport stays the same numerically; anchor switches from
-                    # final_dur to 0, so offset must absorb the old anchor value.
-                    self._center_offset      = final_dur + self._center_offset
+                # Zoom to show the full recording plus live-data space.
+                # left_part = space for the recording (right of x=0)
+                # right_part = space for new live data (left of x=0)
+                left_part  = max(final_dur, LIVE_WINDOW_S / 2.0)
+                right_part = max(final_dur / 4.0, LIVE_WINDOW_S / 2.0)
+                self._live_window_s    = left_part + right_part
+                self._center_offset    = (left_part - right_part) / 2.0
+                # Skip interaction detection on the next tick; the viewport still
+                # shows the old recording range which must not override the zoom.
+                self._expected_x_range = None
             else:
                 # No data captured — discard the reserved color slot.
                 self._color_map.pop(self._in_progress_color_id or "", None)
@@ -1203,6 +1190,9 @@ class MainWindow(QMainWindow):
             # Pre-assign the color this session will use when finalised.
             self._in_progress_color_id = "rec_in_progress"
             self._assign_color(self._in_progress_color_id)
+            # Reset offset so recording starts with the anchor at viewport centre.
+            self._center_offset    = 0.0
+            self._expected_x_range = None
             self._rec_ctrl.start()
 
     def _on_toggle_session(self, session_id: str, visible: bool) -> None:

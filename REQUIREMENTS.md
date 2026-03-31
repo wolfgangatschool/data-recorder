@@ -43,7 +43,22 @@
   `LIVE_WINDOW_S/2` the left edge is negative, showing pre-recording live data there —
   creating a smooth transition from live to recording mode.  Once `dur > LIVE_WINDOW_S/2`
   the window scrolls normally with the newest sample at the centre.
-- When the recording stops, the x-axis is immediately zoomed to show the complete session if `LIVE_WINDOW_S`<`recording_duration`: `[0, recording_duration]` and `LIVE_WINDOW_S` is set to `recording_duration`. if `LIVE_WINDOW_S`>=`recording_duration` the x-axis zoom is not changed by stopping the recording.
+- When the recording stops, the x-axis is immediately zoomed so that:
+  - The full recording `[0, recording_duration]` is always visible.
+  - Space for newly incoming (non-recorded) live data is allocated to the left of
+    `x = 0`, between **½** of the total viewport (short recordings) and **⅕**
+    (long recordings).
+  - Concretely:
+    ```
+    left_part  = max(recording_duration, LIVE_WINDOW_S / 2)   # right edge of viewport
+    right_part = max(recording_duration / 4, LIVE_WINDOW_S / 2)   # space left of x=0
+    new_window = left_part + right_part
+    x_range    = [−right_part, left_part]
+    ```
+    where `LIVE_WINDOW_S` is the compile-time default (20 s).
+    This formula ensures the viewport is at least `LIVE_WINDOW_S` wide and that
+    the live-data fraction transitions smoothly from ½ to ⅕ as recordings grow
+    beyond `2 × LIVE_WINDOW_S`.
 - Every session is uniquely identified by the date-time stamp of its start.
 - A session captures one signal per sensor that was active at any point during the
   recording interval (sensors that disconnect mid-recording are captured up to the point of disconnection, sensors that are connected mid-recording are included in the recording with the first sample they send).
@@ -253,16 +268,24 @@ to avoid the fresh default ViewBox range being mistaken for user interaction.
 | Mode | x range | Anchor | `_center_offset` change |
 |---|---|---|---|
 | Live, not recording | `[−W/2+O, W/2+O]` | 0 | updated on user interaction |
-| Recording | `[dur−W/2+O, dur+W/2+O]` | `dur` | updated on user interaction |
-| Just stopped, `final_dur > W` | `[0, final_dur]` one tick | 0 | set to `final_dur/2` |
-| Just stopped, `final_dur ≤ W` | unchanged | 0 | set to `final_dur + O` (preserves x range) |
-| No sensors | preserved (user pans freely) | — | not changed programmatically |
+| Recording | `[dur−W/2+O, dur+W/2+O]` | `dur` | reset to 0 on record start; updated on user interaction |
+| Just stopped | `[−R, L]` one tick (see below) | 0 | set to `(L−R)/2` |
 
-`W = _live_window_s`, `O = _center_offset`.
+`W = _live_window_s`, `O = _center_offset`, `dur = rec_duration`.
 
-On recording stop the anchor switches from `rec_duration` to `0`.  `_center_offset`
-is adjusted to keep the viewport numerically unchanged: `O_new = final_dur + O_old`.
-When `final_dur > W`, the viewport zooms to `[0, final_dur]` and `O = final_dur/2`.
+`L = max(final_dur, LIVE_WINDOW_S/2)`, `R = max(final_dur/4, LIVE_WINDOW_S/2)`.
+`W_new = L + R`, `O_new = (L−R)/2`.
+
+**Recording start:** `_center_offset` is reset to `0` so the recording begins with the
+natural anchor-at-centre view, regardless of any earlier user pan.
+
+**Recording stop:** the anchor switches from `rec_duration` to `0`.  `_center_offset`
+and `_live_window_s` are set from the formula above, and `_expected_x_range` is set to
+`None` so that the stale recording-time viewport is not mistaken for user interaction.
+
+**Range-setting in `_refresh_plot`:** a single formula `[anchor + O − W/2, anchor + O + W/2]`
+is used whenever there are plots to show.  No separate `_post_stop_duration` one-shot
+branch is needed.
 
 During recording, when `dur < W/2 − O`, the left edge is negative, showing
 pre-recording grey data (smooth visual transition from live to recording mode).
