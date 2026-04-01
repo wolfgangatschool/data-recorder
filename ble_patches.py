@@ -16,8 +16,8 @@ Both ``asyncio.timeout()`` and ``asyncio.TaskGroup()`` abort with
 when ``current_task()`` returns None.
 
 Three patches are applied here. Each is guarded by a sentinel attribute so
-that Streamlit's top-to-bottom re-run loop does not stack another wrapper on
-every page refresh (that would cause a RecursionError after ~1 hour).
+that re-importing this module does not stack another wrapper on top of an
+already-patched function (that would cause a RecursionError).
 
 This module is imported for its side-effects only.  It must be imported before
 any pasco or bleak code runs.
@@ -43,7 +43,7 @@ def _patch_current_task() -> None:
     a nest_asyncio-patched event loop running _PyTask instances.
     """
     if getattr(asyncio.current_task, "_pasco_patched", False):
-        return  # already applied on a previous Streamlit run — do not rewrap
+        return  # already applied — do not rewrap
 
     _c_current_task = asyncio.current_task
 

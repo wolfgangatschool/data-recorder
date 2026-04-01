@@ -5,3 +5,5 @@ __pycache__/
 *.csv
 *.log
 .DS_Store
+test_bt_sampling_rate
+test_datasets

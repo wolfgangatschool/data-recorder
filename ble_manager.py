@@ -29,6 +29,7 @@ Signal summary
                                    unit becomes known (after connect)
 """
 
+import re
 import threading
 import time
 
@@ -36,6 +37,8 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 try:
     import ble_patches  # noqa: F401 — applies macOS pasco compatibility fixes
+    from bleak import BleakScanner
+    from bleak.backends.device import BLEDevice
     from pasco.pasco_ble_device import PASCOBLEDevice
     PASCO_AVAILABLE = True
 except ImportError:
@@ -63,6 +66,46 @@ STALE_TIMEOUT_S: float = 5.0
 # reset to None when all sensors have been removed.
 _global_t0: float | None = None
 _t0_lock = threading.Lock()
+
+
+# ── [WORKAROUND] Corrupted-advertising-name support ───────────────────────────
+# Two development sensors (390-900, 910-042) had their BLE advertising names
+# corrupted by accidental probe commands during reverse-engineering work.  They
+# now advertise as e.g. '\x02 390-900>78' instead of 'Voltage 390-900>78', so
+# pasco.scan() (which filters by 'Voltage', 'Current', …) cannot find them.
+#
+# This block reconstructs the correct advertising name from the model-number
+# suffix that is still intact in the advertisement, enabling these sensors to be
+# used for further development without damaging additional units.
+#
+# REMOVE THIS ENTIRE BLOCK (and the _do_scan / _connect_thread_fn changes below
+# marked [WORKAROUND]) once the development sensors are retired or reflashed.
+# Primary behaviour — intact sensors — is unaffected: they still flow through
+# pasco.scan() exactly as before.
+
+_PASCO_MODEL_RE = re.compile(r'\d{3}-\d{3}>\w{2}')
+
+
+def _reconstruct_pasco_name(raw_name: str) -> str | None:
+    """Return the correct 'AdvertisingName model>id' string for a sensor whose
+    advertising prefix is corrupted, or None if the name is not a PASCO model."""
+    m = _PASCO_MODEL_RE.search(raw_name or "")
+    if not m:
+        return None
+    suffix = m.group()          # e.g. "390-900>78"
+    if len(suffix) < 9:
+        return None
+    try:
+        d = PASCOBLEDevice()
+        iface_id = d._decode64(suffix[8]) + 1024
+        iface = d._xml_root.find(f'./Interfaces/Interface[@ID="{iface_id}"]')
+        if iface is not None:
+            return f"{iface.get('AdvertisingName')} {suffix}"
+    except Exception:
+        pass
+    return None
+
+# ── [END WORKAROUND] ───────────────────────────────────────────────────────────
 
 
 # ── Device metadata ────────────────────────────────────────────────────────────
@@ -235,6 +278,30 @@ class BLEManager(QObject):
                 found        = device.scan() or []
             except Exception:
                 found = []
+
+            # [WORKAROUND] Also pick up sensors whose advertising names are
+            # corrupted and therefore missed by pasco.scan().  Run a raw bleak
+            # scan on pasco's own loop (same CBCentralManager) and reconstruct
+            # the correct name from the intact model-number suffix.
+            # Remove this block when the broken development sensors are retired.
+            try:
+                found_addrs = {d.address for d in found}
+                all_ble = device._loop.run_until_complete(
+                    BleakScanner.discover(timeout=2.0)
+                ) or []
+                for ble_dev in all_ble:
+                    if ble_dev.address in found_addrs:
+                        continue
+                    reconstructed = _reconstruct_pasco_name(ble_dev.name)
+                    if reconstructed:
+                        found.append(BLEDevice(
+                            ble_dev.address, reconstructed,
+                            ble_dev.details, rssi=-60,
+                        ))
+            except Exception:
+                pass
+            # [END WORKAROUND]
+
         results = [_parse_ble_device(d) for d in found]
         self._scan_in_progress = False
         self._scan_last_t      = time.time()
@@ -251,6 +318,30 @@ class BLEManager(QObject):
             try:
                 found = device.scan() or []
                 match = next((d for d in found if d.address == meta.address), None)
+
+                # [WORKAROUND] Fall back to raw bleak scan for sensors whose
+                # corrupted names are not returned by pasco.scan().
+                # Remove when broken development sensors are retired.
+                if match is None:
+                    try:
+                        all_ble = device._loop.run_until_complete(
+                            BleakScanner.discover()
+                        ) or []
+                        raw = next(
+                            (d for d in all_ble if d.address == meta.address),
+                            None,
+                        )
+                        if raw is not None:
+                            reconstructed = _reconstruct_pasco_name(raw.name)
+                            if reconstructed:
+                                match = BLEDevice(
+                                    raw.address, reconstructed,
+                                    raw.details, rssi=-60,
+                                )
+                    except Exception:
+                        pass
+                # [END WORKAROUND]
+
                 if match is None:
                     conn["status"] = "error: sensor not found (out of range?)"
                     self.status_changed.emit(meta.address, conn["status"])
