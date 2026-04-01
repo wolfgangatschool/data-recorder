@@ -37,9 +37,14 @@ class LiveBuffer:
 
     Background streaming threads call append(); the UI thread calls snapshot()
     or last_t() for rendering.  The lock is held for the minimum duration.
+
+    The buffer length is dynamic: call resize() when the streaming rate changes
+    so the live window always holds at least ``rate * LIVE_WINDOW_S * 1.5``
+    samples regardless of rate.  The default is sufficient for polling rates
+    up to 100 Hz.
     """
 
-    MAXLEN = 20_000
+    MAXLEN = 20_000   # default; sufficient for ≤ 100 Hz × 20 s × 1.5
 
     def __init__(self) -> None:
         self._buf: deque[tuple[float, float]] = deque(maxlen=self.MAXLEN)
@@ -61,6 +66,12 @@ class LiveBuffer:
     def clear(self) -> None:
         with self._lock:
             self._buf.clear()
+
+    def resize(self, maxlen: int) -> None:
+        """Change the ring-buffer capacity, preserving the most recent samples."""
+        with self._lock:
+            if self._buf.maxlen != maxlen:
+                self._buf = deque(self._buf, maxlen=maxlen)
 
 
 # ── Container for all active live buffers ─────────────────────────────────────

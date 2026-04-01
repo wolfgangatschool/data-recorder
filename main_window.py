@@ -427,6 +427,7 @@ class PlotPanel(QWidget):
                         symbol='o', symbolSize=4,
                         symbolBrush=_symbol_brush(gray),
                         symbolPen=pg.mkPen(None))
+                    self._curves[key].setDownsampling(auto=True, mode='peak')
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -453,6 +454,7 @@ class PlotPanel(QWidget):
                             symbol='o', symbolSize=4,
                             symbolBrush=_symbol_brush(color),
                             symbolPen=pg.mkPen(None))
+                        self._curves[key].setDownsampling(auto=True, mode='peak')
                     else:
                         self._curves[key].setData(xs, ys)
                         self._curves[key].setPen(pen)
@@ -480,6 +482,7 @@ class PlotPanel(QWidget):
                             symbol='o', symbolSize=4,
                             symbolBrush=_symbol_brush(color),
                             symbolPen=pg.mkPen(None))
+                        self._curves[key].setDownsampling(auto=True, mode='peak')
                     else:
                         self._curves[key].setData(xs, ys)
                         self._curves[key].setPen(pen)
@@ -503,6 +506,7 @@ class PlotPanel(QWidget):
                         symbol='o', symbolSize=4,
                         symbolBrush=_symbol_brush(color),
                         symbolPen=pg.mkPen(None))
+                    self._curves[key].setDownsampling(auto=True, mode='peak')
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -708,14 +712,10 @@ class SensorPanel(QWidget):
 # RatePanel
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Polling steps followed by high-rate steps (Phase 2, greyed out).
-# The divider index marks the first step that exceeds the BLE polling ceiling.
-# BLE one-shot polling (GCMD_READ_ONE_SAMPLE) has a round-trip of ~60 ms on
-# macOS/CoreBluetooth, which sets a hard ceiling of about 17 Hz regardless of
-# the configured poll_interval.  Steps above 20 Hz require the push-notification
-# protocol (Phase 2, not yet implemented) and are therefore greyed out.
+# Full rate step list: polling (≤ 20 Hz via one-shot) + push (> 20 Hz via
+# continuous notifications).  All steps are now active; the strategy is
+# selected automatically in sensor_stream.py based on the configured rate.
 _RATE_STEPS: list[float] = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000]
-_RATE_DIVIDER: int = 5          # indices 0–4 (1–20 Hz) are polling; 5+ need Phase 2
 _RATE_DEFAULT: float = 20.0
 
 def _fmt_rate(hz: float) -> str:
@@ -725,11 +725,11 @@ def _fmt_rate(hz: float) -> str:
 class RatePanel(QWidget):
     """Sampling-rate step control.
 
-    Two groups on a logarithmic step list:
-      - Polling (1–20 Hz): active — achievable via BLE one-shot polling.
-      - Above 20 Hz: greyed out — requires Phase 2 push-notification protocol.
+    Steps ≤ 20 Hz use one-shot BLE polling (PollStream).
+    Steps > 20 Hz use continuous push notifications (PushStream).
+    All steps are active; the strategy is selected automatically.
 
-    Emits rate_changed(float) when the user steps within the polling group.
+    Emits rate_changed(float) whenever the user changes the step.
     """
 
     rate_changed = pyqtSignal(float)   # new rate in Hz
@@ -770,12 +770,6 @@ class RatePanel(QWidget):
 
         layout.addLayout(row)
 
-        self._note_lbl = QLabel()
-        self._note_lbl.setStyleSheet("font-size:10px; color:#9ca3af;")
-        self._note_lbl.setWordWrap(True)
-        self._note_lbl.hide()
-        layout.addWidget(self._note_lbl)
-
         self._idx = _RATE_STEPS.index(_RATE_DEFAULT)
         self._update_buttons()
 
@@ -796,34 +790,12 @@ class RatePanel(QWidget):
             self._idx += 1
             self._apply()
 
-    # Boundary between "needs Phase 2" and "high-rate Phase 2 only" — steps
-    # in [_RATE_DIVIDER, _RATE_PHASE2) exceed the BLE polling ceiling but are
-    # conceptually "medium" rates; steps ≥ _RATE_PHASE2 need burst streaming.
-    _RATE_PHASE2_HI: int = 8   # index of first burst-only step (200 Hz)
-
     def _apply(self) -> None:
         self._update_buttons()
-        if self._idx < _RATE_DIVIDER:
-            self._note_lbl.hide()
-            self.rate_changed.emit(_RATE_STEPS[self._idx])
-        else:
-            # Step exceeds BLE polling ceiling — show note, do NOT emit.
-            if self._idx < self._RATE_PHASE2_HI:
-                self._note_lbl.setText(
-                    "Exceeds BLE polling ceiling (~17 Hz) — "
-                    "requires high-rate mode (Phase 2)")
-            else:
-                self._note_lbl.setText(
-                    "High-rate mode — available in a future update")
-            self._note_lbl.show()
+        self.rate_changed.emit(_RATE_STEPS[self._idx])
 
     def _update_buttons(self) -> None:
-        hz = _RATE_STEPS[self._idx]
-        self._rate_lbl.setText(_fmt_rate(hz))
-        greyed = self._idx >= _RATE_DIVIDER
-        colour = "#9ca3af" if greyed else "inherit"
-        self._rate_lbl.setStyleSheet(
-            f"font-size:12px; font-weight:600; color:{colour};")
+        self._rate_lbl.setText(_fmt_rate(_RATE_STEPS[self._idx]))
         self._prev_btn.setEnabled(self._idx > 0)
         self._next_btn.setEnabled(self._idx < len(_RATE_STEPS) - 1)
 

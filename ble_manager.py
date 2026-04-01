@@ -44,7 +44,8 @@ try:
 except ImportError:
     PASCO_AVAILABLE = False
 
-from data_store import LiveStore, SensorMeta
+from data_store import LIVE_WINDOW_S, LiveStore, SensorMeta
+from sensor_stream import make_strategy
 
 
 # ── Module-level BLE state ─────────────────────────────────────────────────────
@@ -192,15 +193,18 @@ class BLEManager(QObject):
     # ── Public API (main thread only) ─────────────────────────────────────────
 
     def set_sample_rate(self, rate_hz: float) -> None:
-        """Set the polling rate for all active and future connections.
+        """Set the streaming rate for all active and future connections.
 
         Called from the main thread.  Writing a float is atomic under the GIL,
-        so no lock is needed for the streaming threads that read poll_interval.
+        so no additional lock is needed for the streaming threads that read
+        poll_interval.  Setting restart_event signals every active strategy to
+        exit and restart with the new rate.
         """
         self._sample_rate_hz = rate_hz
         interval = 1.0 / rate_hz
         for conn in self._conns.values():
             conn["poll_interval"] = interval
+            conn["restart_event"].set()
 
     def start_scan(self) -> None:
         """Kick off a background scan if one is not already running."""
@@ -220,6 +224,7 @@ class BLEManager(QObject):
         conn = {
             "status":        "starting…",
             "stop_event":    threading.Event(),
+            "restart_event": threading.Event(),
             "thread":        None,
             "unit":          None,
             "label":         meta.quantity,
@@ -377,7 +382,7 @@ class BLEManager(QObject):
         self._stream_sensor(device, meta.address, conn)
 
     def _stream_sensor(self, device, address: str, conn: dict) -> None:
-        """Background: read measurements in a loop until stop_event is set."""
+        """Background: discover measurement, then run strategy loop until stopped."""
         # ── Discover measurement name and unit ────────────────────────────────
         try:
             meas_list = device.get_measurement_list()
@@ -421,22 +426,28 @@ class BLEManager(QObject):
                 _global_t0 = time.time()
             t0 = _global_t0
 
-        # ── Streaming loop ────────────────────────────────────────────────────
-        stop_event     = conn["stop_event"]
-        last_data_time = time.time()
+        # ── Strategy loop — restarts on rate change ───────────────────────────
+        # Each iteration selects a StreamStrategy (PollStream or PushStream)
+        # based on the current rate, clears restart_event, and calls
+        # strategy.stream().  stream() blocks until:
+        #   - stop_event fires  → outer loop exits (loop condition fails)
+        #   - restart_event fires → outer loop continues with new strategy
+        #   - stale / error     → neither event set → break
+        stop_event = conn["stop_event"]
         while not stop_event.is_set():
-            t_poll = time.time()
-            try:
-                val = device.read_data(meas_name)
-                if val is not None:
-                    buf.append(time.time() - t0, float(val))
-                    last_data_time = time.time()
-                elif time.time() - last_data_time > STALE_TIMEOUT_S:
-                    break
-            except Exception:
+            rate_hz = 1.0 / conn["poll_interval"]
+            buf.resize(max(20_000, int(rate_hz * LIVE_WINDOW_S * 1.5)))
+
+            strategy = make_strategy(rate_hz)
+            conn["restart_event"].clear()
+
+            strategy.stream(device, meas_name, t0, buf,
+                            stop_event, conn["restart_event"], conn)
+
+            if not conn["restart_event"].is_set():
+                # stream() exited due to stop_event or sensor error — done.
                 break
-            elapsed = time.time() - t_poll
-            time.sleep(max(0.0, conn["poll_interval"] - elapsed))
+            # restart_event is set: loop continues, selecting a new strategy.
 
         try:
             device.disconnect()

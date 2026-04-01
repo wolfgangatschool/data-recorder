@@ -217,6 +217,33 @@ communication minimal.
 
 ## Implementation notes (deviations from the architecture plan)
 
+### StreamStrategy pattern (sensor streaming)
+
+Polling and push-notification streaming differ fundamentally in protocol,
+timing, error handling, and cleanup.  Spreading these differences across
+`ble_manager.py` and `main_window.py` would entangle BLE transport logic with
+connection management and UI concerns.
+
+Instead, the variance is fully encapsulated in **`sensor_stream.py`**:
+
+```
+StreamStrategy (ABC)
+├── PollStream   — read_data() one-shot polling, ≤ 20 Hz
+└── PushStream   — svc1 push notifications, any rate > 20 Hz
+```
+
+`BLEManager._stream_sensor` calls `make_strategy(rate_hz)` to obtain the right
+implementation, then calls `strategy.stream(device, ...)`.  `stream()` blocks
+until `stop_event` or `restart_event` fires; `BLEManager` restarts with a new
+strategy when the rate changes (e.g. polling → push boundary crossing).
+
+**Why this matters:** adding a third transport (e.g. USB or Ethernet) means
+adding a new `StreamStrategy` subclass — nothing else changes.  The rest of the
+app (connection management, data buffering, UI) never needs to know which
+transport is active.
+
+---
+
 ### File structure
 
 The implemented layer structure maps to four files:
@@ -225,6 +252,7 @@ The implemented layer structure maps to four files:
 |---|---|
 | `data_store.py` | Data layer — `LiveBuffer`, `LiveStore`, `SensorMeta`, `RecordingSession`, `ImportedRun` |
 | `ble_manager.py` | BLE layer — `BLEManager` (QObject with signals) |
+| `sensor_stream.py` | Streaming strategies — `StreamStrategy` ABC, `PollStream`, `PushStream` |
 | `main_window.py` | Application + UI layers — `RecordingController`, `PlotPanel`, `SensorPanel`, `SessionPanel`, `MainWindow` |
 | `main.py` | Entry point |
 | `ble_patches.py` | macOS CoreBluetooth/pasco compatibility patches (unchanged) |
@@ -328,12 +356,16 @@ application default font by default, so all three text elements stay in sync.
 
 ## Sampling Rate Control
 
-Two development phases govern sampling rate support:
+Two transport strategies are used depending on the configured rate:
 
-- **Phase 1 (implemented):** Adjustable one-shot polling, 1–100 Hz.
-  No changes to the BLE notification protocol.
-- **Phase 2 (future):** High-rate push notifications, 200 Hz – 20 kHz.
-  Requires a GATT command sequence reverse-engineered from SPARKvue traffic.
+- **Polling (≤ 20 Hz):** `PollStream` — one-shot `GCMD_READ_ONE_SAMPLE` per
+  sample.  Reliable with no changes to sensor firmware state.
+- **Push (> 20 Hz):** `PushStream` — continuous push notifications up to
+  the sensor's hardware limit (~2 kHz for PS-3211/PS-3212).
+
+Both are encapsulated in `sensor_stream.py` behind the `StreamStrategy` ABC.
+`BLEManager` selects the right strategy based on the configured rate and
+restarts it transparently on rate changes.
 
 ---
 
@@ -346,11 +378,10 @@ Two development phases govern sampling rate support:
   the setting is preserved when no sensors are connected.
 - The control presents **two groups** of discrete steps on a **logarithmic
   scale**, separated by a visual divider:
-  - **Polling group** (≤ 100 Hz, one-shot, no dead zones):
-    `1, 2, 5, 10, 20, 25, 50, 100 Hz` — default **20 Hz**
-  - **High-rate group** (> 100 Hz, Phase 2, not yet implemented):
-    `200, 250, 500, 1k, 2k Hz` — **greyed out**;
-    hovering shows `"High-rate mode — available in a future update"`.
+  - **Polling group** (≤ 20 Hz, one-shot BLE polling):
+    `1, 2, 5, 10, 20 Hz` — default **20 Hz**
+  - **Push group** (> 20 Hz, continuous push notifications):
+    `25, 50, 100, 200, 250, 500, 1k, 2k Hz` — all active.
 - The UI control is a row of **◀ / ▶ step buttons** with a centred label
   (e.g. `"20 Hz"`), snapping through the combined step list.
 - A rate change takes effect **immediately** for all currently connected
@@ -402,11 +433,10 @@ Two development phases govern sampling rate support:
 
 ---
 
-### Phase 2 — High-Rate Push Notifications (> 100 Hz) — Future
+### Phase 2 — High-Rate Push Notifications (> 20 Hz)
 
-> **Status:** not yet implemented.  All technical details below are
-> confirmed by BLE traffic capture and probe experiments; the implementation
-> is blocked only by the decision to defer it to Phase 2.
+> **Status:** implemented in `sensor_stream.py` (`PushStream`).  All details
+> below are confirmed by BLE traffic capture and probe experiments.
 
 #### Sensors and hardware limits
 
@@ -447,20 +477,24 @@ experiments):**
 **Confirmed streaming init sequence** (from PacketLogger capture of
 SPARKvue at 2 kHz, targeting svc1 SEND_CMD `4a5c0001-0002-…`):
 
+The pklg was recorded with two sensors running simultaneously, so the
+svc0 commands appear interleaved.  The per-sensor sequence is:
+
 ```
-Write h=42  [0x01, 0xf4, 0x01, 0x00, 0x00, 0x02, 0x00]  # start-stream, period=500 µs
+Write svc1 SEND_CMD  [0x01, p0, p1, p2, p3, 0x02, 0x00]   # start-stream; p=period µs LE
 sleep 50 ms
-Write h=42  [0x28, 0x00, 0x00, 0x02]                     # unknown setup A
+Write svc1 SEND_CMD  [0x28, 0x00, 0x00, N]                 # setup A
+                                                             #   N=0x04 (Voltage PS-3211)
+                                                             #   N=0x02 (Current PS-3212)
+sleep 100 ms   # sensor sends [0xC0, 0x00, 0x28] ACK on svc1 RECV_CMD during this wait
+Write svc1 SEND_CMD  [0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00]  # setup B
 sleep 100 ms
-Write h=42  [0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00]  # setup B
-sleep 100 ms
-Write h=36  [0x06, 0x90, 0x03]                           # svc0 cmd
+Write svc0 SEND_CMD  <svc0_cmd>    # sensor-specific 3-byte command:
+                                   #   Voltage: [0x06, 0x5a, 0x00]
+                                   #   Current: [0x06, 0x90, 0x03]
 sleep 50 ms
-Write h=36  [0x06, 0x5a, 0x00]                           # svc0 cmd
+Write svc0 SEND_CMD  [0x00]        # keepalive
 sleep 50 ms
-Write h=36  [0x00]                                        # keepalive
-sleep 50 ms
-Write h=36  [0x00]                                        # keepalive
 ```
 
 The delays between commands are **required**; sending them without delays
@@ -478,7 +512,7 @@ causes the sensor to produce no notifications.
   boundaries.  At 2 kHz, `data_size = 2` bytes per sample → 69–70
   samples per packet.
 
-**ACK protocol** (to h=49 / `4a5c0001-0005-…`):
+**ACK protocol** (to svc1 SEND_ACK / `4a5c0001-0005-…`):
 ```python
 [0x00, 0x00, 0x00, 0x00, seq % 32]
 ```
@@ -488,17 +522,21 @@ as SPARKvue does).
 
 **GATT handle layout** (confirmed on intact PS-3211A / PS-3212):
 
-| Handle | UUID suffix | Direction | Role |
-|---|---|---|---|
-| h=35 | `0001-0002` | write | svc0 SEND_CMD (one-shot polling) |
-| h=37 | `0001-0003` | notify | svc0 RECV_CMD (poll responses) |
-| h=41 | `0001-0002` (svc1) | write | svc1 SEND_CMD (stream start/stop) |
-| h=43 | `0001-0003` (svc1) | notify | svc1 RECV_CMD |
-| h=46 | `0001-0004` (svc1) | notify | svc1 DATA (push stream packets) |
-| h=49 | `0001-0005` (svc1) | write | svc1 SEND_ACK |
+_Note: the table lists both the characteristic-declaration handle and the
+value handle.  Bleak operates on UUIDs and value handles; the declaration
+handle is shown for reference only._
+
+| Decl. | Value | UUID suffix | Direction | Role |
+|---|---|---|---|---|
+| h=35 | h=36 | `0000-0002` | write | svc0 SEND_CMD (one-shot polling) |
+| h=37 | h=38 | `0000-0003` | notify | svc0 RECV_CMD (poll responses) |
+| h=41 | h=42 | `0001-0002` | write | svc1 SEND_CMD (stream init) |
+| h=43 | h=44 | `0001-0003` | notify | svc1 RECV_CMD (streaming acks) |
+| h=46 | h=47 | `0001-0004` | notify | svc1 DATA (push stream packets) |
+| h=49 | h=50 | `0001-0005` | write | svc1 SEND_ACK |
 
 pasco UUID pattern: `4a5c000{service_id}-000{char_id}-0000-0000-5c1e741f1c00`
-where `service_id = sensor_id + 1` (0-indexed sensor → 1-indexed service).
+where `service_id` = 0 for svc0 (polling), 1 for svc1 (streaming).
 
 **Fast calibration path** (Phase 2 implementation detail):
 Rather than calling `_decode_data()` (which has significant overhead per
@@ -539,18 +577,28 @@ At 20 kHz × 20 s × 1.5 ≈ 600 000 samples per sensor (~9.6 MB as float64
 pairs).  A 10-minute recording at 20 kHz = 24 000 000 samples per sensor
 (~768 MB).  Users must be warned before starting a long high-rate recording.
 
-#### Phase 2 architecture (outline, not yet implemented)
+#### Phase 2 architecture (implemented)
+
+**`sensor_stream.py`:**
+- `PushStream.stream()` runs the full svc1 init sequence and intercepts
+  `DATA` characteristic notifications via bleak's internal callback dict.
+- Calibration extracted once at stream start using pasco XML `FactoryCal`
+  parameters; applied as `round(slope * raw_u16 + intercept, precision)`.
+- ACK written to `SEND_ACK` every 8 packets; sensor stops within 2 packets
+  if ACKs cease — stop is implicit (no explicit stop command required).
 
 **`ble_manager.py`:**
-- Add `_stream_sensor_high_rate(device, address, conn, rate_hz)`.
-- `set_sample_rate()` for rates > 100 Hz: send stop-stream command to any
-  active polling connection, then switch to `_stream_sensor_high_rate`.
+- `set_sample_rate()` sets `restart_event` on every active connection.
+- `_stream_sensor()` outer loop: calls `make_strategy(rate_hz)`, runs
+  `strategy.stream()`, loops if `restart_event` set, exits otherwise.
+- `LiveBuffer.resize()` called before each strategy run: capacity adapts
+  to `max(20_000, int(rate_hz × LIVE_WINDOW_S × 1.5))`.
 
 **`main_window.py`:**
-- Enable (un-grey) the high-rate slider steps.
-- Update `LiveBuffer.MAXLEN` dynamically when switching to high-rate mode.
-- Apply `setDownsampling(auto=True, mode='peak')` to all curves;
-  `mode='peak'` preserves spike features rather than averaging them away.
+- All rate steps now active; `RatePanel._apply()` emits `rate_changed` for
+  every step without a greyed-out guard.
+- `setDownsampling(auto=True, mode='peak')` applied to all curves at
+  creation time; `mode='peak'` preserves spike features at high densities.
 
 ## Active Workarounds — Must Be Removed
 
@@ -594,10 +642,8 @@ file is affected.
 3. **Analysis panel**: add a `QDockWidget` with fit controls (model selection,
    parameter display) reading `SessionStore` via `scipy.optimize.curve_fit`.
 
-4. **High-rate implementation (Phase 2)**: the full GATT command sequence,
-   packet format, and ACK protocol have been reverse-engineered (see Phase 2
-   section above).  Implementation is deferred to Phase 2 by design, not for
-   lack of technical information.
+4. **High-rate implementation (Phase 2)**: implemented in `sensor_stream.py`.
+   See the Phase 2 section above for the confirmed GATT protocol details.
 
 5. **High-rate memory**: a 10-minute recording at 20 kHz uses ~768 MB for two
    sensors.  If memory pressure becomes an issue, consider streaming recorded
