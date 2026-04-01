@@ -159,8 +159,75 @@ def _patch_pasco_connect() -> None:
     PASCOBLEDevice.connect = _connect
 
 
+# ── Patch 4: Fix Select-measurement input selection and precision ──────────────
+
+def _patch_select_measurement() -> None:
+    """
+    Fix two bugs in PASCOBLEDevice._calculate_with_input for Select-type
+    measurements (used by WirelessCurrentSensor PS-3212 and WirelessVoltageSensor
+    PS-3211).
+
+    Bug 1 — Wrong range selection: pasco always uses inputs[0] regardless of
+    the sensor's actual range setting, causing the WirelessCurrentSensor to
+    report values ≈10× too small (±100 mA calibration used when sensor is in
+    the default ±1 A mode).
+
+    Bug 2 — Pre-rounded intermediate values: CalCurrent (Internal=1) carries
+    Precision=2, so _decode_data rounds it to 10 mA steps before the Select
+    measurement reads it.  By always recomputing via _get_measurement_value
+    (which reads from the raw integer stored in _sensor_data by the first
+    decode loop, not from the Precision=2-rounded intermediate value), full
+    ADC precision flows through to the Precision=3 (1 mA) Select output.
+
+    Fix applies only to Select measurements that carry a
+    RangeSettingsDigitsCounts attribute encoding the range-selector constant
+    measurement ID and the per-range digit counts.  For Select measurements
+    without that attribute (e.g. the voltage sensor), the original behaviour
+    is preserved.
+    """
+    if getattr(PASCOBLEDevice._calculate_with_input,
+               "_pasco_patched_select", False):
+        return
+
+    _orig = PASCOBLEDevice._calculate_with_input
+
+    def _patched(self, m, sensor_id):
+        if m.get('Type') != 'Select':
+            return _orig(self, m, sensor_id)
+
+        inputs = m['Inputs'].split(',') if isinstance(m['Inputs'], str) else [str(m['Inputs'])]
+        selected_idx = 0   # default: first input (original pasco behaviour)
+
+        rsd = m.get('RangeSettingsDigitsCounts', '')
+        if rsd:
+            try:
+                rs_id  = int(str(rsd).split('|')[0])
+                rs_val = self._sensor_data[sensor_id].get(rs_id)
+                rs_m   = self._device_measurements[sensor_id].get(rs_id, {})
+                if rs_val is not None and 'Values' in rs_m:
+                    # Values format: "label1:value1:label2:value2:…"
+                    parts = rs_m['Values'].split(':')
+                    for i in range(1, len(parts), 2):
+                        if float(parts[i]) == float(rs_val):
+                            selected_idx = (i - 1) // 2
+                            break
+            except Exception:
+                selected_idx = 0   # fall back to first input on any error
+
+        need_input = (int(inputs[selected_idx])
+                      if selected_idx < len(inputs) else int(inputs[0]))
+
+        # Always recompute from raw to bypass any Precision-truncated value
+        # stored in _sensor_data during an earlier _decode_data iteration.
+        return self._get_measurement_value(sensor_id, need_input)
+
+    _patched._pasco_patched_select = True
+    PASCOBLEDevice._calculate_with_input = _patched
+
+
 # ── Apply all patches once at import time ─────────────────────────────────────
 
 _patch_current_task()
 _patch_central_manager_connect()
 _patch_pasco_connect()
+_patch_select_measurement()

@@ -386,6 +386,10 @@ class PlotPanel(QWidget):
         active_keys: set[str] = set()
         half = live_window_s / 2
 
+        def _symbol_brush(color):
+            """Filled circle brush matching the line color, no outline."""
+            return pg.mkBrush(color)
+
         # ── Live (grey) traces — pre-recording history only ────────────────────
         for j, addr in enumerate(sorted(managed_addrs)):
             for unit, addr_map in live_snapshot.items():
@@ -419,7 +423,10 @@ class PlotPanel(QWidget):
                 if key not in self._curves:
                     lv_lbl = (live_labels or {}).get(addr, addr[-6:])
                     self._curves[key] = self._plots[unit].plot(
-                        xs, ys, pen=pen, name=lv_lbl)
+                        xs, ys, pen=pen, name=lv_lbl,
+                        symbol='o', symbolSize=4,
+                        symbolBrush=_symbol_brush(gray),
+                        symbolPen=pg.mkPen(None))
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -442,7 +449,10 @@ class PlotPanel(QWidget):
                     ys = [p[1] for p in pts]
                     if key not in self._curves:
                         self._curves[key] = self._plots[unit].plot(
-                            xs, ys, pen=pen, name=lbl)
+                            xs, ys, pen=pen, name=lbl,
+                            symbol='o', symbolSize=4,
+                            symbolBrush=_symbol_brush(color),
+                            symbolPen=pg.mkPen(None))
                     else:
                         self._curves[key].setData(xs, ys)
                         self._curves[key].setPen(pen)
@@ -466,7 +476,10 @@ class PlotPanel(QWidget):
                     ys = [p[1] for p in pts]
                     if key not in self._curves:
                         self._curves[key] = self._plots[unit].plot(
-                            xs, ys, pen=pen, name=trace_name)
+                            xs, ys, pen=pen, name=trace_name,
+                            symbol='o', symbolSize=4,
+                            symbolBrush=_symbol_brush(color),
+                            symbolPen=pg.mkPen(None))
                     else:
                         self._curves[key].setData(xs, ys)
                         self._curves[key].setPen(pen)
@@ -486,7 +499,10 @@ class PlotPanel(QWidget):
                 ys = series.get("values", [])
                 if key not in self._curves:
                     self._curves[key] = self._plots[unit].plot(
-                        xs, ys, pen=pen, name=run.label)
+                        xs, ys, pen=pen, name=run.label,
+                        symbol='o', symbolSize=4,
+                        symbolBrush=_symbol_brush(color),
+                        symbolPen=pg.mkPen(None))
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -686,6 +702,130 @@ class SensorPanel(QWidget):
     def connect_refresh_to(self, slot) -> None:
         self._refresh_btn.clicked.disconnect()
         self._refresh_btn.clicked.connect(slot)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RatePanel
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Polling steps followed by high-rate steps (Phase 2, greyed out).
+# The divider index marks the first step that exceeds the BLE polling ceiling.
+# BLE one-shot polling (GCMD_READ_ONE_SAMPLE) has a round-trip of ~60 ms on
+# macOS/CoreBluetooth, which sets a hard ceiling of about 17 Hz regardless of
+# the configured poll_interval.  Steps above 20 Hz require the push-notification
+# protocol (Phase 2, not yet implemented) and are therefore greyed out.
+_RATE_STEPS: list[float] = [1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000]
+_RATE_DIVIDER: int = 5          # indices 0–4 (1–20 Hz) are polling; 5+ need Phase 2
+_RATE_DEFAULT: float = 20.0
+
+def _fmt_rate(hz: float) -> str:
+    return f"{int(hz / 1000)}k Hz" if hz >= 1000 else f"{int(hz)} Hz"
+
+
+class RatePanel(QWidget):
+    """Sampling-rate step control.
+
+    Two groups on a logarithmic step list:
+      - Polling (1–20 Hz): active — achievable via BLE one-shot polling.
+      - Above 20 Hz: greyed out — requires Phase 2 push-notification protocol.
+
+    Emits rate_changed(float) when the user steps within the polling group.
+    """
+
+    rate_changed = pyqtSignal(float)   # new rate in Hz
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(4)
+
+        title = QLabel("SAMPLE RATE")
+        title.setStyleSheet("font-size:10px; font-weight:600; color:#9ca3af;"
+                            " letter-spacing:1px;")
+        layout.addWidget(title)
+
+        # ◀ label ▶ row
+        row = QHBoxLayout()
+        row.setSpacing(4)
+
+        self._prev_btn = QPushButton("◀")
+        self._prev_btn.setFixedWidth(28)
+        self._prev_btn.setStyleSheet("QPushButton { border:1px solid #d1d5db;"
+                                     " border-radius:4px; padding:2px; }"
+                                     " QPushButton:hover { background:#f3f4f6; }")
+        row.addWidget(self._prev_btn)
+
+        self._rate_lbl = QLabel(_fmt_rate(_RATE_DEFAULT))
+        self._rate_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._rate_lbl.setStyleSheet("font-size:12px; font-weight:600;")
+        row.addWidget(self._rate_lbl, 1)
+
+        self._next_btn = QPushButton("▶")
+        self._next_btn.setFixedWidth(28)
+        self._next_btn.setStyleSheet("QPushButton { border:1px solid #d1d5db;"
+                                     " border-radius:4px; padding:2px; }"
+                                     " QPushButton:hover { background:#f3f4f6; }")
+        row.addWidget(self._next_btn)
+
+        layout.addLayout(row)
+
+        self._note_lbl = QLabel()
+        self._note_lbl.setStyleSheet("font-size:10px; color:#9ca3af;")
+        self._note_lbl.setWordWrap(True)
+        self._note_lbl.hide()
+        layout.addWidget(self._note_lbl)
+
+        self._idx = _RATE_STEPS.index(_RATE_DEFAULT)
+        self._update_buttons()
+
+        self._prev_btn.clicked.connect(self._on_prev)
+        self._next_btn.clicked.connect(self._on_next)
+
+    @property
+    def current_rate(self) -> float:
+        return _RATE_STEPS[self._idx]
+
+    def _on_prev(self) -> None:
+        if self._idx > 0:
+            self._idx -= 1
+            self._apply()
+
+    def _on_next(self) -> None:
+        if self._idx < len(_RATE_STEPS) - 1:
+            self._idx += 1
+            self._apply()
+
+    # Boundary between "needs Phase 2" and "high-rate Phase 2 only" — steps
+    # in [_RATE_DIVIDER, _RATE_PHASE2) exceed the BLE polling ceiling but are
+    # conceptually "medium" rates; steps ≥ _RATE_PHASE2 need burst streaming.
+    _RATE_PHASE2_HI: int = 8   # index of first burst-only step (200 Hz)
+
+    def _apply(self) -> None:
+        self._update_buttons()
+        if self._idx < _RATE_DIVIDER:
+            self._note_lbl.hide()
+            self.rate_changed.emit(_RATE_STEPS[self._idx])
+        else:
+            # Step exceeds BLE polling ceiling — show note, do NOT emit.
+            if self._idx < self._RATE_PHASE2_HI:
+                self._note_lbl.setText(
+                    "Exceeds BLE polling ceiling (~17 Hz) — "
+                    "requires high-rate mode (Phase 2)")
+            else:
+                self._note_lbl.setText(
+                    "High-rate mode — available in a future update")
+            self._note_lbl.show()
+
+    def _update_buttons(self) -> None:
+        hz = _RATE_STEPS[self._idx]
+        self._rate_lbl.setText(_fmt_rate(hz))
+        greyed = self._idx >= _RATE_DIVIDER
+        colour = "#9ca3af" if greyed else "inherit"
+        self._rate_lbl.setStyleSheet(
+            f"font-size:12px; font-weight:600; color:{colour};")
+        self._prev_btn.setEnabled(self._idx > 0)
+        self._next_btn.setEnabled(self._idx < len(_RATE_STEPS) - 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -942,6 +1082,16 @@ class MainWindow(QMainWindow):
         self._sensor_panel.connect_refresh_to(self._on_manual_scan)
         v.addWidget(self._sensor_panel)
 
+        # Rate panel
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setStyleSheet("color:#e5e7eb; margin:4px 8px;")
+        v.addWidget(sep1)
+
+        self._rate_panel = RatePanel()
+        self._rate_panel.rate_changed.connect(self._on_rate_changed)
+        v.addWidget(self._rate_panel)
+
         # Divider between panels
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -1167,6 +1317,10 @@ class MainWindow(QMainWindow):
     def _on_manual_scan(self) -> None:
         if self._ble:
             self._ble.start_scan()
+
+    def _on_rate_changed(self, rate_hz: float) -> None:
+        if self._ble:
+            self._ble.set_sample_rate(rate_hz)
 
     # ── Live Discovery toggle ─────────────────────────────────────────────────
 

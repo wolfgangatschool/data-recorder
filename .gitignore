@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 test_bt_sampling_rate
 test_datasets
+CLAUDE.md

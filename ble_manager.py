@@ -160,6 +160,8 @@ class BLEManager(QObject):
         self._managed_addrs: set[str] = set()
         # Metadata cache so the sensor panel can display info after connection.
         self._meta: dict[str, SensorMeta] = {}
+        # Current polling rate; applied to new connections and live connections.
+        self._sample_rate_hz: float = 20.0
 
     # ── Read-only properties ───────────────────────────────────────────────────
 
@@ -189,6 +191,17 @@ class BLEManager(QObject):
 
     # ── Public API (main thread only) ─────────────────────────────────────────
 
+    def set_sample_rate(self, rate_hz: float) -> None:
+        """Set the polling rate for all active and future connections.
+
+        Called from the main thread.  Writing a float is atomic under the GIL,
+        so no lock is needed for the streaming threads that read poll_interval.
+        """
+        self._sample_rate_hz = rate_hz
+        interval = 1.0 / rate_hz
+        for conn in self._conns.values():
+            conn["poll_interval"] = interval
+
     def start_scan(self) -> None:
         """Kick off a background scan if one is not already running."""
         if self._scan_in_progress:
@@ -205,11 +218,12 @@ class BLEManager(QObject):
         self._managed_addrs.add(addr)
         self._meta[addr] = meta
         conn = {
-            "status":     "starting…",
-            "stop_event": threading.Event(),
-            "thread":     None,
-            "unit":       None,
-            "label":      meta.quantity,
+            "status":        "starting…",
+            "stop_event":    threading.Event(),
+            "thread":        None,
+            "unit":          None,
+            "label":         meta.quantity,
+            "poll_interval": 1.0 / self._sample_rate_hz,
         }
         self._conns[addr] = conn
         t = threading.Thread(
@@ -411,6 +425,7 @@ class BLEManager(QObject):
         stop_event     = conn["stop_event"]
         last_data_time = time.time()
         while not stop_event.is_set():
+            t_poll = time.time()
             try:
                 val = device.read_data(meas_name)
                 if val is not None:
@@ -420,7 +435,8 @@ class BLEManager(QObject):
                     break
             except Exception:
                 break
-            time.sleep(0.05)
+            elapsed = time.time() - t_poll
+            time.sleep(max(0.0, conn["poll_interval"] - elapsed))
 
         try:
             device.disconnect()
