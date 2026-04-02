@@ -27,13 +27,18 @@
 - After a sensor disconnects (or errors), it is removed from the list and reappears in the dropdown.
 
 ### Live Data Streaming
-- Connected sensors stream data continuously; only the most recent `LIVE_WINDOW_S` seconds of live data are retained and displayed.
+- Connected sensors stream data continuously; only the most recent samples are retained.
 - Live (unrecorded) signal is shown in the plot as **grey, semi-opaque** lines.
-- The plot window is `LIVE_WINDOW_S` wide (default 20 s). The newest sample is
-  always at the **centre** of the plot. The right half `[0, LIVE_WINDOW_S/2]` shows
-  empty future space; the left half `[-LIVE_WINDOW_S/2, 0]` shows recent history.
-- When **not recording**, the time axis shows `(-LIVE_WINDOW_S/2, +LIVE_WINDOW_S/2)`,
-  with `0s` (latest sample) fixed at the centre.
+- The live ring buffer is capped at `LIVE_BUFFER_MAXLEN = 100 000` samples.
+  At high sample rates this limits the available history to `100 000 / sample_rate`
+  seconds (e.g. 5 s at 20 kHz).
+- The plot window right half is `LIVE_WINDOW_S/2` wide (future / empty space).
+  The left half (live history) is `min(LIVE_WINDOW_S/2, 100 000 / sample_rate)`,
+  making the visible window asymmetric at high sample rates.
+- The newest sample is always at the **centre** anchor of the plot.
+- When **not recording**, the time axis shows `(−left, +LIVE_WINDOW_S/2)`,
+  with `0s` (latest sample) fixed at the centre anchor.  `left` is the capped
+  look-back duration defined above.
 
 ### Recording
 - "Record" button starts a recording session; "Stop" finalises it.
@@ -356,249 +361,109 @@ application default font by default, so all three text elements stay in sync.
 
 ## Sampling Rate Control
 
-Two transport strategies are used depending on the configured rate:
-
-- **Polling (≤ 20 Hz):** `PollStream` — one-shot `GCMD_READ_ONE_SAMPLE` per
-  sample.  Reliable with no changes to sensor firmware state.
-- **Push (> 20 Hz):** `PushStream` — continuous push notifications up to
-  the sensor's hardware limit (~2 kHz for PS-3211/PS-3212).
-
-Both are encapsulated in `sensor_stream.py` behind the `StreamStrategy` ABC.
-`BLEManager` selects the right strategy based on the configured rate and
-restarts it transparently on rate changes.
-
----
-
-### Phase 1 — Adjustable Polling Rate (1–100 Hz)
-
-#### Functional requirements
+### Functional requirements
 
 - A **sampling rate control** is visible in the sidebar, below the sensor
-  connection panel and above the session panel.  Always visible and editable;
-  the setting is preserved when no sensors are connected.
-- The control presents **two groups** of discrete steps on a **logarithmic
-  scale**, separated by a visual divider:
-  - **Polling group** (≤ 20 Hz, one-shot BLE polling):
-    `1, 2, 5, 10, 20 Hz` — default **20 Hz**
-  - **Push group** (> 20 Hz, continuous push notifications):
-    `25, 50, 100, 200, 250, 500, 1k, 2k Hz` — all active.
-- The UI control is a row of **◀ / ▶ step buttons** with a centred label
-  (e.g. `"20 Hz"`), snapping through the combined step list.
-- A rate change takes effect **immediately** for all currently connected
-  sensors and for any sensor connected subsequently.  No reconnect required.
-- Rate changes are allowed **before, during, and after a recording**.
+  connection panel.  Always visible; the setting is preserved when no sensors
+  are connected.
+- Discrete steps on a logarithmic scale:
+  `1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1k, 2k, 2.5k, 5k, 10k, 20k Hz`.
+  Default: **20 Hz**.
+- UI: ◀ / ▶ step buttons with a centred rate label (e.g. `"20 Hz"`).
+- A rate change takes effect immediately for all connected sensors.
+  No reconnect required.
+- Rate changes are allowed before, during, and after a recording.
 
-#### Consistency constraints
+### Behaviour on rate change
 
-- At 100 Hz × 20 s live window: 2 000 samples — well within
-  `LiveBuffer.MAXLEN = 20 000`.  No `MAXLEN` change is needed for Phase 1.
-- Recordings use **absolute timestamps**; non-uniform sample spacing caused
-  by a mid-recording rate change is handled automatically by the `(t, v)`
-  plot representation.  No changes to `RecordingController` are needed.
-- `conn["poll_interval"]` is a Python `float` written by the main thread and
-  read by the streaming thread.  The GIL makes single-value float assignment
-  atomic for this purpose; no additional lock is needed.
-- The 333 ms plot timer flushes up to `333 ms × 100 Hz = 33` new samples per
-  tick — well within the capacity of the flush loop.
-- `STALE_TIMEOUT_S = 5.0` is unchanged: a sensor that stops responding is
-  always disconnected within 5 s regardless of the configured poll rate.
+- Changing rate triggers an immediate restart of the streaming strategy for
+  each connected sensor.
+- At the transition there is a **brief gap in the live plot** while the
+  sensor settles at the new rate.  This is expected and preferable to
+  corrupt data near the boundary.
+- All ADC values including boundary values (0x0000 = −full-scale, 0xFFFF ≈
+  +full-scale) are valid measurements and are never filtered out.
+- Recordings use absolute timestamps; non-uniform sample spacing from a
+  mid-recording rate change is handled automatically by the `(t, v)` plot.
 
-#### Architecture (Phase 1)
+### Data volume
 
-**`ble_manager.py`:**
-- Add `_sample_rate_hz: float = 20.0` field to `BLEManager.__init__`.
-- Add `BLEManager.set_sample_rate(rate_hz: float)`:
-  writes `1.0 / rate_hz` into `conn["poll_interval"]` for every active
-  connection; stores `rate_hz` in `_sample_rate_hz` for sensors connected
-  later.
-- `_connect_thread_fn`: initialise `conn["poll_interval"] =
-  1.0 / self._sample_rate_hz` before launching `_stream_sensor`.
-- `_stream_sensor` polling loop: replace `time.sleep(0.05)` with
-  ```python
-  t_poll = time.time()
-  val    = device.read_data(meas_name)
-  elapsed = time.time() - t_poll
-  time.sleep(max(0.0, conn["poll_interval"] - elapsed))
-  ```
-  Reading `conn["poll_interval"]` each iteration means a rate change
-  set by `set_sample_rate()` takes effect on the very next sleep cycle.
+- Live buffer capacity scales automatically with rate.
+- Long high-rate recordings accumulate significant data.  No warning is
+  required for typical lab durations (< 5 min).
 
-**`main_window.py`:**
-- Add `RatePanel` widget (sidebar, inserted between `SensorPanel` and the
-  `SessionPanel` separator).
-- Widget holds the ordered step list and current index; the high-rate
-  indices are disabled and carry a tooltip.
-- On step change: call `self._ble.set_sample_rate(rate_hz)`.
-- No changes to `RecordingController`, `PlotPanel`, or `data_store.py`.
+### Architecture
 
----
+Two transport strategies are encapsulated in `sensor_stream.py` behind a
+`StreamStrategy` ABC.  `BLEManager` selects the strategy, runs it, and
+restarts it on rate changes.  Nothing else in the app needs to know which
+transport is active.
 
-### Phase 2 — High-Rate Push Notifications (> 20 Hz)
+- **`PollStream`** (≤ 20 Hz): one-shot request/response per sample.
+  Reliable, no sensor state changes.  Adapts to rate changes within the
+  current run — no restart needed.
+- **`PushStream`** (> 20 Hz): sensor streams samples autonomously at the
+  configured rate.  Requires an init sequence, explicit per-packet
+  acknowledgement, and a stop command on exit.  Restarts on rate change;
+  discards a brief transition window of data after each init to flush
+  residual old-rate packets.
 
-> **Status:** implemented in `sensor_stream.py` (`PushStream`).  All details
-> below are confirmed by BLE traffic capture and probe experiments.
+### PushStream protocol (confirmed from PacketLogger capture)
 
-#### Sensors and hardware limits
-
-| Sensor | Model | MaxRate | MaxBurstRate | MaxBurstSamples |
-|---|---|---|---|---|
-| Wireless Voltage Sensor | PS-3211 | 1 000 Hz | 100 000 Hz | 1 000 |
-| Wireless Current Sensor | PS-3212 | 1 000 Hz | 100 000 Hz | 1 000 |
-
-#### Acquisition mechanisms
-
-**Mechanism A — one-shot polling (Phase 1, currently used):**
-Each call to `device.read_data(meas_name)` sends `GCMD_READ_ONE_SAMPLE`
-(0x05) to the device, which responds with one measurement value.  Round-trip
-over BLE on macOS: ~20–50 ms, giving ~20–50 Hz reliably and up to ~100 Hz
-experimentally.
-
-**Mechanism B — continuous push notifications (Phase 2):**
-The sensor streams data autonomously at its configured internal rate.
-Notification packets carry a 1-byte sequence counter (`data[0] <= 0x1F`,
-values 0–31) followed by a continuous stream of uint16-LE samples spanning
-packet boundaries.  The pasco library's `process_measurement_response`
-already has a branch for this path, but no public API activates it.
-
-**Commands and opcodes (confirmed by PacketLogger capture and probe
-experiments):**
-
-- `GCMD_READ_ONE_SAMPLE` (0x05): one-shot polling — responds on svc0
-  RECV_CMD (h=38).  ~28 Hz pipeline.
-- `0x06`: returns one RMS sample (~300 ms round-trip, ~3 Hz); the sensor
-  must be ACKed before it accepts the next request.  **Does not start
-  autonomous streaming.**
-- `GCMD_XFER_BURST_RAM` (0x0E): RAM memory-read; used only in
-  `read_factory_cal()`.  Not related to streaming.
-- `WIRELESS_RMS_START = [0x37, 0x01, 0x00]`: sent only for
-  `_dev_type == "Rotary Motion"` sensors.  No effect on voltage/current.
-- `0x08`, `0x09`: return error responses.  `0x07`: no response.
-
-**Confirmed streaming init sequence** (from PacketLogger capture of
-SPARKvue at 2 kHz, targeting svc1 SEND_CMD `4a5c0001-0002-…`):
-
-The pklg was recorded with two sensors running simultaneously, so the
-svc0 commands appear interleaved.  The per-sensor sequence is:
+GATT handles used (PS-3211 voltage / PS-3212 current):
 
 ```
-Write svc1 SEND_CMD  [0x01, p0, p1, p2, p3, 0x02, 0x00]   # start-stream; p=period µs LE
-sleep 50 ms
-Write svc1 SEND_CMD  [0x28, 0x00, 0x00, N]                 # setup A
-                                                             #   N=0x04 (Voltage PS-3211)
-                                                             #   N=0x02 (Current PS-3212)
-sleep 100 ms   # sensor sends [0xC0, 0x00, 0x28] ACK on svc1 RECV_CMD during this wait
-Write svc1 SEND_CMD  [0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00]  # setup B
-sleep 100 ms
-Write svc0 SEND_CMD  <svc0_cmd>    # sensor-specific 3-byte command:
-                                   #   Voltage: [0x06, 0x5a, 0x00]
-                                   #   Current: [0x06, 0x90, 0x03]
-sleep 50 ms
-Write svc0 SEND_CMD  [0x00]        # keepalive
-sleep 50 ms
+svc0 SEND_CMD  4a5c0000-0002-...  polling commands, stop, keepalive
+svc1 SEND_CMD  4a5c0001-0002-...  streaming init commands
+svc1 RECV_CMD  4a5c0001-0003-...  init ACK responses from sensor
+svc1 DATA      4a5c0001-0004-...  push-notification stream
+svc1 SEND_ACK  4a5c0001-0005-...  per-packet ACK writes
 ```
 
-The delays between commands are **required**; sending them without delays
-causes the sensor to produce no notifications.
-
-**Stream-start command encoding** (`[0x01, period_lo, period_hi, 0x00, 0x00, 0x02, 0x00]`):
-- Byte 0: `0x01` = start streaming.
-- Bytes 1–4: sample period in µs as uint32 LE.
-  e.g. 500 µs → `[0xf4, 0x01, 0x00, 0x00]` (2 kHz).
-- Bytes 5–6: `0x02, 0x00` — suffix (purpose unknown; required).
-
-**Notification packet format** (140 bytes per packet, on h=47 / `4a5c0001-0004-…`):
-- Byte 0: sequence counter 0–31 (`data[0] <= 0x1F`).
-- Bytes 1–139: continuous uint16-LE sample stream, spanning packet
-  boundaries.  At 2 kHz, `data_size = 2` bytes per sample → 69–70
-  samples per packet.
-
-**ACK protocol** (to svc1 SEND_ACK / `4a5c0001-0005-…`):
-```python
-[0x00, 0x00, 0x00, 0x00, seq % 32]
+**Init sequence** (both sensors, same sequence per sensor):
 ```
-The sensor **stops streaming after ~2 packets** if no ACK is received.
-ACKs must be sent after each received packet (or at minimum every 8 packets
-as SPARKvue does).
-
-**GATT handle layout** (confirmed on intact PS-3211A / PS-3212):
-
-_Note: the table lists both the characteristic-declaration handle and the
-value handle.  Bleak operates on UUIDs and value handles; the declaration
-handle is shown for reference only._
-
-| Decl. | Value | UUID suffix | Direction | Role |
-|---|---|---|---|---|
-| h=35 | h=36 | `0000-0002` | write | svc0 SEND_CMD (one-shot polling) |
-| h=37 | h=38 | `0000-0003` | notify | svc0 RECV_CMD (poll responses) |
-| h=41 | h=42 | `0001-0002` | write | svc1 SEND_CMD (stream init) |
-| h=43 | h=44 | `0001-0003` | notify | svc1 RECV_CMD (streaming acks) |
-| h=46 | h=47 | `0001-0004` | notify | svc1 DATA (push stream packets) |
-| h=49 | h=50 | `0001-0005` | write | svc1 SEND_ACK |
-
-pasco UUID pattern: `4a5c000{service_id}-000{char_id}-0000-0000-5c1e741f1c00`
-where `service_id` = 0 for svc0 (polling), 1 for svc1 (streaming).
-
-**Fast calibration path** (Phase 2 implementation detail):
-Rather than calling `_decode_data()` (which has significant overhead per
-sample), pre-compute a linear slope/intercept at connect time from pasco's
-XML `FactoryCal` parameters using `_calc_4_params(raw, x1, y1, x2, y2)`.
-For the standard `Select → FactoryCal` chain used by voltage and current
-sensors, calibrated value = `round(slope * raw_uint16 + intercept, precision)`.
-This gives ~10× lower per-sample CPU overhead.
-
-**Timestamp assignment for batched packets:**
+Write svc1 SEND_CMD  [0x01, p0, p1, p2, p3, 0x02, 0x00]  # period µs LE
+Write svc1 SEND_CMD  [0x28, 0x00, 0x00, N]                # N: 0x04 voltage / 0x02 current
+sleep ~55 ms
+Write svc1 SEND_CMD  [0x29, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00]
+Write svc0 SEND_CMD  svc0_cmd                              # sensor-specific (fixed, see below)
+sleep ~10 ms
+Write svc0 SEND_CMD  [0x00]                                # keepalive
 ```
-t_sample_i = t_batch_received - n_samples_in_batch / rate + i / rate
+
+**Sensor-specific svc0_cmd values** (fixed, rate-independent):
 ```
-where `t_batch_received` is the wall-clock time the notification callback
-fired and `i` is the 0-based sample index within the batch.
+Voltage  PS-3211:  [0x06, 0x7c, 0x06]
+Current  PS-3212:  [0x06, 0x0b, 0x03]
+```
 
-#### BLE bandwidth
+**Stop command** (after each streaming run, before next init or on disconnect):
+```
+Write svc0 SEND_CMD  [0x07]
+```
 
-Each BLE notification packet carries up to ~120 two-byte samples
-(ATT MTU ≈ 247 bytes).
+**Notification format** (rate-dependent packet size):
+```
+byte 0      : sequence counter 0–31
+bytes 1–end : uint16-LE ADC samples
 
-| Sample rate | Packets/s | BLE interval needed | Feasibility |
-|---|---|---|---|
-| 500 Hz | ~5 | ~200 ms | Easy |
-| 1 kHz | ~9 | ~112 ms | Easy |
-| 5 kHz | ~42 | ~24 ms | Good |
-| 10 kHz | ~84 | ~12 ms | Acceptable (BLE 4.x min ~7.5 ms) |
-| 20 kHz | ~167 | ~6 ms | Needs BLE 5 / modern macOS |
+Samples per packet = rate_hz / 10  (sensor groups 100 ms of data per packet)
+Exceptions:
+  ≤ 500 Hz  : payload always an even number of bytes → no leftover
+  2000 Hz   : BLE MTU limits payload to 139 bytes → 69 samples + 1 leftover byte
+              The leftover byte is the LOW byte of the next uint16; prepend it
+              to the following packet's payload before unpacking.
+```
 
-Continuous push notifications have no dead zones; latency is one BLE
-connection interval (~7.5–45 ms).
+**ACK protocol** (every 8 packets):
+```
+Write svc1 SEND_ACK  [0x00, 0x00, 0x00, 0x00, last_seq_in_batch % 32]
+```
+ACK byte cycles: 7 → 15 → 23 → 31 → 7 → …
 
-#### Phase 2 memory requirements
-
-Ring buffer `MAXLEN` must be rate-adaptive:
-`max(20_000, int(rate * LIVE_WINDOW_S * 1.5))`.
-At 20 kHz × 20 s × 1.5 ≈ 600 000 samples per sensor (~9.6 MB as float64
-pairs).  A 10-minute recording at 20 kHz = 24 000 000 samples per sensor
-(~768 MB).  Users must be warned before starting a long high-rate recording.
-
-#### Phase 2 architecture (implemented)
-
-**`sensor_stream.py`:**
-- `PushStream.stream()` runs the full svc1 init sequence and intercepts
-  `DATA` characteristic notifications via bleak's internal callback dict.
-- Calibration extracted once at stream start using pasco XML `FactoryCal`
-  parameters; applied as `round(slope * raw_u16 + intercept, precision)`.
-- ACK written to `SEND_ACK` every 8 packets; sensor stops within 2 packets
-  if ACKs cease — stop is implicit (no explicit stop command required).
-
-**`ble_manager.py`:**
-- `set_sample_rate()` sets `restart_event` on every active connection.
-- `_stream_sensor()` outer loop: calls `make_strategy(rate_hz)`, runs
-  `strategy.stream()`, loops if `restart_event` set, exits otherwise.
-- `LiveBuffer.resize()` called before each strategy run: capacity adapts
-  to `max(20_000, int(rate_hz × LIVE_WINDOW_S × 1.5))`.
-
-**`main_window.py`:**
-- All rate steps now active; `RatePanel._apply()` emits `rate_changed` for
-  every step without a greyed-out guard.
-- `setDownsampling(auto=True, mode='peak')` applied to all curves at
-  creation time; `mode='peak'` preserves spike features at high densities.
+`BLEManager.set_sample_rate()` propagates a rate change to all active
+connections and triggers strategy restarts.  New connections pick up the
+current rate automatically.
 
 ## Active Workarounds — Must Be Removed
 

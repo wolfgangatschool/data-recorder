@@ -44,7 +44,7 @@ try:
 except ImportError:
     PASCO_AVAILABLE = False
 
-from data_store import LIVE_WINDOW_S, LiveStore, SensorMeta
+from data_store import LIVE_BUFFER_MAXLEN, LIVE_WINDOW_S, LiveStore, SensorMeta
 from sensor_stream import make_strategy
 
 
@@ -436,7 +436,7 @@ class BLEManager(QObject):
         stop_event = conn["stop_event"]
         while not stop_event.is_set():
             rate_hz = 1.0 / conn["poll_interval"]
-            buf.resize(max(20_000, int(rate_hz * LIVE_WINDOW_S * 1.5)))
+            buf.resize(min(LIVE_BUFFER_MAXLEN, max(20_000, int(rate_hz * LIVE_WINDOW_S * 1.5))))
 
             strategy = make_strategy(rate_hz)
             conn["restart_event"].clear()

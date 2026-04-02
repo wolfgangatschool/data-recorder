@@ -37,7 +37,8 @@ from PyQt6.QtWidgets import (
 )
 
 from data_store import (
-    LIVE_WINDOW_S, ImportedRun, LiveStore, RecordingSession, SensorMeta,
+    LIVE_BUFFER_MAXLEN, LIVE_WINDOW_S,
+    ImportedRun, LiveStore, RecordingSession, SensorMeta,
 )
 from ble_manager import PASCO_AVAILABLE, SCAN_INTERVAL_S
 
@@ -363,6 +364,7 @@ class PlotPanel(QWidget):
         is_recording:         bool,
         rec_start_abs:        float | None,
         live_window_s:        float = LIVE_WINDOW_S,
+        live_left_s:          float | None = None,
         in_progress_data:     dict | None = None,
         in_progress_labels:   dict[str, str] | None = None,
         in_progress_color_id: str | None = None,
@@ -378,6 +380,8 @@ class PlotPanel(QWidget):
         is_recording         — True during an active recording
         rec_start_abs        — absolute t (LiveBuffer time base) of first recorded sample
         live_window_s        — current effective window width
+        live_left_s          — max seconds of live history shown left of anchor;
+                               defaults to live_window_s/2 when None
         in_progress_data     — {unit: {addr: [(t_rebased, v)]}} for the active recording
         in_progress_labels   — {addr: label} for sensors in the active recording
         in_progress_color_id — color_map key for the in-progress session
@@ -385,6 +389,7 @@ class PlotPanel(QWidget):
         """
         active_keys: set[str] = set()
         half = live_window_s / 2
+        left_s = live_left_s if live_left_s is not None else half
 
         def _symbol_brush(color):
             """Filled circle brush matching the line color, no outline."""
@@ -404,12 +409,12 @@ class PlotPanel(QWidget):
                     # Recorded data (x ≥ 0) is drawn as the vivid in-progress trace.
                     pts = [(t - rec_start_abs, v)
                            for t, v in pts
-                           if t >= rec_start_abs - half and t < rec_start_abs]
+                           if t >= rec_start_abs - left_s and t < rec_start_abs]
                 else:
                     # Re-base so newest sample → 0 (centre of viewport).
                     t_newest = pts[-1][0]
                     pts = [(t - t_newest, v) for t, v in pts
-                           if t >= t_newest - half]
+                           if t >= t_newest - left_s]
 
                 if not pts:
                     continue
@@ -428,6 +433,7 @@ class PlotPanel(QWidget):
                         symbolBrush=_symbol_brush(gray),
                         symbolPen=pg.mkPen(None))
                     self._curves[key].setDownsampling(auto=True, mode='peak')
+                    self._curves[key].setClipToView(True)
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -455,6 +461,7 @@ class PlotPanel(QWidget):
                             symbolBrush=_symbol_brush(color),
                             symbolPen=pg.mkPen(None))
                         self._curves[key].setDownsampling(auto=True, mode='peak')
+                        self._curves[key].setClipToView(True)
                     else:
                         self._curves[key].setData(xs, ys)
                         self._curves[key].setPen(pen)
@@ -483,6 +490,7 @@ class PlotPanel(QWidget):
                             symbolBrush=_symbol_brush(color),
                             symbolPen=pg.mkPen(None))
                         self._curves[key].setDownsampling(auto=True, mode='peak')
+                        self._curves[key].setClipToView(True)
                     else:
                         self._curves[key].setData(xs, ys)
                         self._curves[key].setPen(pen)
@@ -507,6 +515,7 @@ class PlotPanel(QWidget):
                         symbolBrush=_symbol_brush(color),
                         symbolPen=pg.mkPen(None))
                     self._curves[key].setDownsampling(auto=True, mode='peak')
+                    self._curves[key].setClipToView(True)
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
@@ -952,6 +961,10 @@ class MainWindow(QMainWindow):
         # session id on Stop so the color stays stable across the transition.
         self._in_progress_color_id: str | None = None
 
+        # ── Current sample rate ────────────────────────────────────────────────
+        # Kept in sync with RatePanel; used to cap the live look-back window.
+        self._sample_rate_hz: float = _RATE_DEFAULT
+
         # ── Effective live window width ────────────────────────────────────────
         # Initialised from the module constant; updated when:
         #   • a recording longer than the current window finishes (grows to fit)
@@ -1157,6 +1170,11 @@ class MainWindow(QMainWindow):
                 if meta:
                     live_labels[addr] = meta.display_label
 
+        # Compute effective left look-back: cap at buffer capacity / sample rate.
+        half         = self._live_window_s / 2
+        max_left_s   = LIVE_BUFFER_MAXLEN / self._sample_rate_hz
+        half_left    = min(half, max_left_s)
+
         # Update curves.
         self._plot_panel.update_curves(
             live_snapshot        = snapshot,
@@ -1167,6 +1185,7 @@ class MainWindow(QMainWindow):
             is_recording         = self._rec_ctrl.is_recording,
             rec_start_abs        = self._rec_ctrl.rec_start_abs,
             live_window_s        = self._live_window_s,
+            live_left_s          = half_left,
             in_progress_data     = self._rec_ctrl.in_progress_data,
             in_progress_labels   = self._rec_ctrl.in_progress_labels,
             in_progress_color_id = self._in_progress_color_id,
@@ -1174,13 +1193,11 @@ class MainWindow(QMainWindow):
         )
 
         # Set x-axis range whenever there are plots.
-        # Formula: [anchor + O − half, anchor + O + half]
-        # where anchor = rec_duration while recording, 0 otherwise.
+        # Left edge is capped at max_left_s to match buffer capacity.
         if self._plot_panel._plots:
-            half   = self._live_window_s / 2
-            anchor = (self._rec_ctrl.rec_duration
-                      if self._rec_ctrl.is_recording else 0.0)
-            x_start = anchor + self._center_offset - half
+            anchor  = (self._rec_ctrl.rec_duration
+                       if self._rec_ctrl.is_recording else 0.0)
+            x_start = anchor + self._center_offset - half_left
             x_end   = anchor + self._center_offset + half
             self._plot_panel.set_x_range(x_start, x_end)
             self._expected_x_range = (x_start, x_end)
@@ -1291,6 +1308,7 @@ class MainWindow(QMainWindow):
             self._ble.start_scan()
 
     def _on_rate_changed(self, rate_hz: float) -> None:
+        self._sample_rate_hz = rate_hz
         if self._ble:
             self._ble.set_sample_rate(rate_hz)
 

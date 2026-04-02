@@ -225,9 +225,49 @@ def _patch_select_measurement() -> None:
     PASCOBLEDevice._calculate_with_input = _patched
 
 
+# ── Patch 5: Drop push-stream data packets in process_measurement_response ────
+
+def _patch_process_measurement_response() -> None:
+    """
+    Silently discard push-stream data packets that reach pasco's measurement
+    notification handler.
+
+    When PushStream intercepts the DATA characteristic callback (by replacing
+    the entry in bleak's _characteristic_notify_callbacks dict), pasco's own
+    callback for that characteristic is bypassed.  However, if the interception
+    is not fully effective (e.g. the DATA handle is not pre-registered by pasco
+    at connect time), push-stream packets can still reach
+    process_measurement_response, which then calls _decode_data() and tries
+    asyncio.create_task(_decode_data()), failing with TypeError because
+    _decode_data is synchronous and returns None.  A second problem is pasco's
+    _send_ack, which passes the already-resolved UUID string back through
+    write(), causing a ValueError.
+
+    Push-stream data packets are identified by their first byte being a rolling
+    sequence counter in 0–31 (≤ 0x1F).  When detected, this patch resets the
+    internal ACK counter and returns without calling _decode_data or _send_ack.
+    """
+    if getattr(PASCOBLEDevice.process_measurement_response,
+               "_pasco_patched_push_drop", False):
+        return
+
+    _orig_pmr = PASCOBLEDevice.process_measurement_response
+
+    def _patched(self, data):
+        if data and data[0] <= 0x1F:
+            # Push-stream sequence packet: reset ACK counter and discard.
+            self._data_ack_counter = 0
+            return
+        return _orig_pmr(self, data)
+
+    _patched._pasco_patched_push_drop = True
+    PASCOBLEDevice.process_measurement_response = _patched
+
+
 # ── Apply all patches once at import time ─────────────────────────────────────
 
 _patch_current_task()
 _patch_central_manager_connect()
 _patch_pasco_connect()
 _patch_select_measurement()
+_patch_process_measurement_response()

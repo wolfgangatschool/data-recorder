@@ -14,6 +14,10 @@ from typing import Optional
 # Width of the live-sensor scrolling window in seconds.
 LIVE_WINDOW_S: float = 20.0
 
+# Hard cap on live ring-buffer size (samples).  At 20 kHz this covers 5 s of
+# history, which is the maximum live look-back at high sample rates.
+LIVE_BUFFER_MAXLEN: int = 100_000
+
 
 # ── Sensor metadata ────────────────────────────────────────────────────────────
 
@@ -44,7 +48,7 @@ class LiveBuffer:
     up to 100 Hz.
     """
 
-    MAXLEN = 20_000   # default; sufficient for ≤ 100 Hz × 20 s × 1.5
+    MAXLEN = 20_000   # default; sufficient for ≤ 667 Hz × 20 s × 1.5
 
     def __init__(self) -> None:
         self._buf: deque[tuple[float, float]] = deque(maxlen=self.MAXLEN)
