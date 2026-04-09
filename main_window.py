@@ -432,7 +432,7 @@ class PlotPanel(QWidget):
                         symbol='o', symbolSize=4,
                         symbolBrush=_symbol_brush(gray),
                         symbolPen=pg.mkPen(None))
-                    self._curves[key].setDownsampling(auto=True, mode='peak')
+                    self._curves[key].setDownsampling(auto=True)
                     self._curves[key].setClipToView(True)
                 else:
                     self._curves[key].setData(xs, ys)
@@ -460,7 +460,7 @@ class PlotPanel(QWidget):
                             symbol='o', symbolSize=4,
                             symbolBrush=_symbol_brush(color),
                             symbolPen=pg.mkPen(None))
-                        self._curves[key].setDownsampling(auto=True, mode='peak')
+                        self._curves[key].setDownsampling(auto=True)
                         self._curves[key].setClipToView(True)
                     else:
                         self._curves[key].setData(xs, ys)
@@ -489,7 +489,7 @@ class PlotPanel(QWidget):
                             symbol='o', symbolSize=4,
                             symbolBrush=_symbol_brush(color),
                             symbolPen=pg.mkPen(None))
-                        self._curves[key].setDownsampling(auto=True, mode='peak')
+                        self._curves[key].setDownsampling(auto=True)
                         self._curves[key].setClipToView(True)
                     else:
                         self._curves[key].setData(xs, ys)
@@ -514,7 +514,7 @@ class PlotPanel(QWidget):
                         symbol='o', symbolSize=4,
                         symbolBrush=_symbol_brush(color),
                         symbolPen=pg.mkPen(None))
-                    self._curves[key].setDownsampling(auto=True, mode='peak')
+                    self._curves[key].setDownsampling(auto=True)
                     self._curves[key].setClipToView(True)
                 else:
                     self._curves[key].setData(xs, ys)
@@ -851,6 +851,7 @@ class SessionPanel(QWidget):
         layout.addWidget(scroll, 1)
 
         self._entry_rows: dict[str, QWidget] = {}
+        self._external_import_slot = None
 
         self._import_btn.clicked.connect(self._on_import)
 
@@ -904,11 +905,11 @@ class SessionPanel(QWidget):
             self, "Load CSV", "", "CSV files (*.csv);;All files (*)")
         if path:
             self._import_btn.setProperty("pending_path", path)
-            self._import_btn.clicked.emit()  # MainWindow intercepts
+            if self._external_import_slot:
+                self._external_import_slot()
 
     def connect_import_to(self, slot) -> None:
-        self._import_btn.clicked.disconnect()
-        self._import_btn.clicked.connect(slot)
+        self._external_import_slot = slot
 
     def pending_import_path(self) -> str | None:
         return self._import_btn.property("pending_path")
