@@ -493,6 +493,105 @@ file is affected.
 
 ---
 
+## Curve Fitting
+
+### Overview
+
+A curve-fitting mode lets the user overlay a parametric model on any recorded
+or imported trace.  The fit is added to the MEASUREMENTS list and rendered on
+the plot like any other trace.
+
+### Activation
+
+A **"∿ Fit"** toggle button in the toolbar (right of Download CSV).  When
+active:
+- A `LinearRegionItem` appears on all subplots (spanning roughly ¼ of the
+  current viewport).  The user drags its edges to select the time window.
+- A **Fit Panel** appears in the sidebar, below the MEASUREMENTS section.
+
+### Fit Panel layout
+
+```
+CURVE FIT
+[Trace dropdown               ▼]
+[f(t) = ________________       ]   ← QLineEdit, monospace
+[error message if any          ]   ← hidden unless error
+[ Fit ]
+──────────────────────────────
+  param = value ± error          ← results table, shown after fit
+```
+
+- **Trace dropdown** lists every visible recorded session and imported run,
+  one entry per unit (e.g. `"14:30:00 (A)"`, `"Run 1 (V)"`).
+- **Formula field** accepts a Python/sympy expression of `t`, e.g.
+  `U0/RD * (1 - exp(-RD/L*t))`.  The independent variable is always `t`.
+  All other free symbols are treated as free parameters.
+- Supported functions: `exp`, `sin`, `cos`, `sqrt`, `log`, `pi`, `e`, and
+  standard arithmetic.  Implicit multiplication (e.g. `2t`) is supported.
+
+### Fitting algorithm
+
+- Data within the selected time window is extracted from the chosen trace.
+- Expression is parsed with **sympy** (`parse_expr` + `implicit_multiplication`),
+  then compiled to a numpy callable via `lambdify`.
+- Fitted via `scipy.optimize.curve_fit` (Levenberg-Marquardt, equivalent to
+  MLE under Gaussian noise).
+- Initial parameter guesses: all **1.0** (architecture is open to extension via
+  `_initial_guesses(param_names)`).
+- If the expression has no free parameters, it is evaluated directly (no
+  fitting step) and overlaid as-is.
+- Fit result + 1σ parameter uncertainties are shown in the panel.
+
+### Fit result as a run entry
+
+On success, a `FitResult` is appended to the MEASUREMENTS list:
+
+```
+  [☑ ƒ Fit 1   ] [✏] [－]
+```
+
+- **ƒ** prefix distinguishes fits from sessions and CSV imports.
+- **✏ (pencil)** button re-opens the fit panel pre-filled with the existing
+  fit's trace, formula, and time window for editing.  Re-fitting replaces the
+  entry in-place (same label, same color).
+- **－** removes the entry and its curve.
+- Fit curve is drawn as a **dashed vivid line** within `[t_min, t_max]`.
+- Color is assigned from the same pool as sessions and CSV imports.
+- Visibility toggle works like any other entry.
+
+### Data model (`FitResult` in `data_store.py`)
+
+```python
+@dataclass
+class FitResult:
+    id:           str                    # "fit_N"
+    label:        str                    # "Fit 1", "Fit 2", …
+    unit:         str                    # subplot unit (e.g. "A", "V")
+    t_min:        float                  # selection window start
+    t_max:        float                  # selection window end
+    expr_str:     str                    # raw RHS formula text
+    source_id:    str                    # id of the fitted trace
+    params:       dict[str, float]       # best-fit parameter values
+    param_errors: dict[str, float]       # 1σ standard errors
+    t_array:      list[float]            # 300-point time grid for rendering
+    v_array:      list[float]            # corresponding fitted values
+    visible:      bool = True
+```
+
+`t_array` / `v_array` are computed once at fit time and stored; no re-eval
+during rendering.
+
+### Architecture
+
+| File | Change |
+|---|---|
+| `data_store.py` | Add `FitResult` dataclass |
+| `main_window.py` | Add `FitPanel` widget; `LinearRegionItem` management in `PlotPanel`; `_on_fit_requested` and related slots in `MainWindow`; extend `update_curves` to render fit curves; extend `SessionPanel.add_entry` with optional pencil button |
+
+No changes to `ble_manager.py`, `sensor_stream.py`, or the BLE/recording stack.
+
+---
+
 ## Open Questions / To-Do
 
 1. **Faster sensor discovery**: investigate whether `pasco.scan()` accepts a

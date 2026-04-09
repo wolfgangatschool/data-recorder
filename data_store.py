@@ -189,3 +189,32 @@ class ImportedRun:
         self.run_num       = run_num
         self.data          = data
         self.visible: bool = True
+
+
+# ── Curve fit result ───────────────────────────────────────────────────────────
+
+@dataclass
+class FitResult:
+    """One fitted parametric curve overlaid on a recorded or imported trace.
+
+    t_array / v_array are a dense 300-point grid computed once at fit time.
+    They are stored so that PlotPanel can render without re-evaluating the
+    expression on every tick.
+
+    params / param_errors hold the best-fit values and 1σ uncertainties.
+    The initial-guess strategy is kept outside this class so callers can
+    extend it later without changing the data model.
+    """
+
+    id:           str
+    label:        str                  # "Fit 1", "Fit 2", …
+    unit:         str                  # subplot unit matched at fit time
+    t_min:        float                # selection window start (seconds)
+    t_max:        float                # selection window end (seconds)
+    expr_str:     str                  # raw RHS formula as the user typed it
+    source_id:    str                  # id of the RecordingSession / ImportedRun
+    params:       dict                 # {name: best-fit value}
+    param_errors: dict                 # {name: 1σ std-error}
+    t_array:      list                 # time coordinates for the fit curve
+    v_array:      list                 # value coordinates for the fit curve
+    visible:      bool = True

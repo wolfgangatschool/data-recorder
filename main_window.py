@@ -32,13 +32,13 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDockWidget, QFileDialog, QFrame,
-    QHBoxLayout, QLabel, QMainWindow, QPushButton, QScrollArea,
-    QSizePolicy, QToolBar, QVBoxLayout, QWidget, QComboBox,
+    QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QToolBar, QVBoxLayout, QWidget, QComboBox,
 )
 
 from data_store import (
     LIVE_BUFFER_MAXLEN, LIVE_WINDOW_S,
-    ImportedRun, LiveStore, RecordingSession, SensorMeta,
+    FitResult, ImportedRun, LiveStore, RecordingSession, SensorMeta,
 )
 from ble_manager import PASCO_AVAILABLE, SCAN_INTERVAL_S
 
@@ -260,6 +260,8 @@ class PlotPanel(QWidget):
     connected the user can pan/zoom freely.
     """
 
+    fit_region_changed = pyqtSignal(float, float)   # t_min, t_max
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         pg.setConfigOptions(antialias=True, background="w", foreground="k")
@@ -274,6 +276,11 @@ class PlotPanel(QWidget):
         self._curves: dict[str, pg.PlotDataItem] = {}    # curve_key → curve
         self._vlines: list[pg.InfiniteLine] = []
         self._mouse_proxy = None
+
+        # Fit-region state
+        self._fit_active: bool = False
+        self._fit_bounds: tuple[float, float] = (0.0, 10.0)
+        self._fit_regions: list[tuple[pg.PlotItem, object]] = []  # (plot, region)
 
     # ── Layout management ─────────────────────────────────────────────────────
 
@@ -321,6 +328,9 @@ class PlotPanel(QWidget):
                 rateLimit=60, slot=self._on_mouse_moved,
             )
 
+        if self._fit_active:
+            self._rebuild_fit_regions()
+
     # ── Crosshair ─────────────────────────────────────────────────────────────
 
     def _on_mouse_moved(self, evt) -> None:
@@ -331,6 +341,51 @@ class PlotPanel(QWidget):
                 for v in self._vlines:
                     v.setPos(x)
                 break
+
+    # ── Fit region ────────────────────────────────────────────────────────────
+
+    def show_fit_region(self, t_min: float, t_max: float) -> None:
+        """Show (or move) the selection band on all subplots."""
+        self._fit_active = True
+        self._fit_bounds = (t_min, t_max)
+        self._rebuild_fit_regions()
+
+    def hide_fit_region(self) -> None:
+        """Remove the selection band from all subplots."""
+        self._fit_active = False
+        self._remove_fit_regions()
+
+    def _rebuild_fit_regions(self) -> None:
+        self._remove_fit_regions()
+        t_min, t_max = self._fit_bounds
+        for p in self._plots.values():
+            region = pg.LinearRegionItem(
+                values=[t_min, t_max],
+                brush=pg.mkBrush(100, 150, 255, 25),
+                pen=pg.mkPen((100, 150, 255, 180), width=1),
+            )
+            region.sigRegionChanged.connect(
+                lambda _, r=region: self._on_region_moved(r))
+            p.addItem(region)
+            self._fit_regions.append((p, region))
+
+    def _remove_fit_regions(self) -> None:
+        for plot, region in self._fit_regions:
+            try:
+                plot.removeItem(region)
+            except Exception:
+                pass
+        self._fit_regions.clear()
+
+    def _on_region_moved(self, source: object) -> None:
+        t_min, t_max = source.getRegion()
+        self._fit_bounds = (t_min, t_max)
+        for _, region in self._fit_regions:
+            if region is not source:
+                region.blockSignals(True)
+                region.setRegion([t_min, t_max])
+                region.blockSignals(False)
+        self.fit_region_changed.emit(t_min, t_max)
 
     # ── X-axis control ────────────────────────────────────────────────────────
 
@@ -369,6 +424,7 @@ class PlotPanel(QWidget):
         in_progress_labels:   dict[str, str] | None = None,
         in_progress_color_id: str | None = None,
         live_labels:          dict[str, str] | None = None,
+        fit_results:          list | None = None,
     ) -> None:
         """Refresh all visible curves with current data.
 
@@ -519,6 +575,25 @@ class PlotPanel(QWidget):
                 else:
                     self._curves[key].setData(xs, ys)
                     self._curves[key].setPen(pen)
+
+        # ── Fit result curves (dashed vivid lines) ────────────────────────────
+        for fit in (fit_results or []):
+            if not fit.visible:
+                continue
+            if fit.unit not in self._plots:
+                continue
+            color = color_map.get(fit.id, FILE_COLORS[0])
+            pen   = pg.mkPen(color=color, width=2,
+                             style=Qt.PenStyle.DashLine)
+            key   = f"fit|{fit.unit}|{fit.id}"
+            active_keys.add(key)
+            xs, ys = fit.t_array, fit.v_array
+            if key not in self._curves:
+                self._curves[key] = self._plots[fit.unit].plot(
+                    xs, ys, pen=pen, name=fit.label)
+            else:
+                self._curves[key].setData(xs, ys)
+                self._curves[key].setPen(pen)
 
         # ── Remove stale curves ────────────────────────────────────────────────
         for key in list(self._curves):
@@ -818,6 +893,7 @@ class SessionPanel(QWidget):
 
     remove_session_requested = pyqtSignal(str)   # session_id
     remove_run_requested     = pyqtSignal(str)   # run_id
+    remove_fit_requested     = pyqtSignal(str)   # fit_id
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -858,7 +934,7 @@ class SessionPanel(QWidget):
     # ── External API ──────────────────────────────────────────────────────────
 
     def add_entry(self, entry_id: str, label: str, on_toggle,
-                  visible: bool = True) -> None:
+                  visible: bool = True, on_edit=None) -> None:
         if entry_id in self._entry_rows:
             return
         row = QWidget()
@@ -871,6 +947,17 @@ class SessionPanel(QWidget):
         cb.setStyleSheet("font-size:11px;")
         cb.stateChanged.connect(lambda state, eid=entry_id: on_toggle(eid, bool(state)))
         h.addWidget(cb, 1)
+
+        if on_edit is not None:
+            edit_btn = QPushButton("✏")
+            edit_btn.setFixedWidth(22)
+            edit_btn.setToolTip("Edit fit")
+            edit_btn.setStyleSheet(
+                "QPushButton { border:1px solid #d1d5db; border-radius:4px;"
+                " padding:1px; font-size:10px; }"
+                " QPushButton:hover { background:#eff6ff; }")
+            edit_btn.clicked.connect(lambda _, eid=entry_id: on_edit(eid))
+            h.addWidget(edit_btn)
 
         remove_btn = QPushButton("－")
         remove_btn.setFixedWidth(22)
@@ -894,7 +981,9 @@ class SessionPanel(QWidget):
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _on_remove(self, entry_id: str) -> None:
-        if entry_id.startswith("csv_"):
+        if entry_id.startswith("fit_"):
+            self.remove_fit_requested.emit(entry_id)
+        elif entry_id.startswith("csv_"):
             self.remove_run_requested.emit(entry_id)
         else:
             self.remove_session_requested.emit(entry_id)
@@ -916,6 +1005,320 @@ class SessionPanel(QWidget):
 
     def clear_pending_import(self) -> None:
         self._import_btn.setProperty("pending_path", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FitPanel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ParamSliderRow(QWidget):
+    """One row in the FitPanel parameter display: name, value, ±error, and a slider.
+
+    The slider range defaults to ±10× the fitted value magnitude.  The user
+    can narrow or widen the range by editing the min/max fields; changes are
+    applied immediately when the field loses focus or Enter is pressed.
+    """
+
+    value_changed = pyqtSignal(str, float)   # param_name, new_value
+
+    _FIELD_STYLE  = "font-size:9px; padding:1px 2px;"
+    _LABEL_STYLE  = "font-size:10px; font-weight:600; color:#1f2937;"
+    _VALUE_STYLE  = "font-size:10px; font-family:Menlo,Monaco,'Courier New'; color:#1f2937;"
+    _ERR_STYLE    = "font-size:9px; color:#6b7280;"
+
+    def __init__(self, name: str, value: float, error: float, parent=None) -> None:
+        super().__init__(parent)
+        self._name  = name
+        self._value = value
+
+        mag = max(abs(value), 1e-6)
+        self._min_val = value - 10.0 * mag
+        self._max_val = value + 10.0 * mag
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 3, 0, 1)
+        outer.setSpacing(1)
+
+        # ── Top row: name (left) + value (right) ─────────────────────────────
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(4)
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(self._LABEL_STYLE)
+        self._val_lbl = QLabel(f"{value:.5g}")
+        self._val_lbl.setStyleSheet(self._VALUE_STYLE)
+        self._val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        top.addWidget(name_lbl)
+        top.addWidget(self._val_lbl)
+        outer.addLayout(top)
+
+        # ── Error label ───────────────────────────────────────────────────────
+        import math
+        if not math.isnan(error):
+            err_lbl = QLabel(f"± {error:.2g}")
+            err_lbl.setStyleSheet(self._ERR_STYLE)
+            outer.addWidget(err_lbl)
+
+        # ── Slider row: [min] ────slider──── [max] ────────────────────────────
+        slider_row = QHBoxLayout()
+        slider_row.setContentsMargins(0, 0, 0, 0)
+        slider_row.setSpacing(3)
+
+        self._min_edit = QLineEdit(f"{self._min_val:.3g}")
+        self._min_edit.setFixedWidth(52)
+        self._min_edit.setStyleSheet(self._FIELD_STYLE)
+        self._min_edit.editingFinished.connect(self._on_range_changed)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, 1000)
+        self._slider.setValue(self._to_pos(value))
+        self._slider.valueChanged.connect(self._on_slider_moved)
+
+        self._max_edit = QLineEdit(f"{self._max_val:.3g}")
+        self._max_edit.setFixedWidth(52)
+        self._max_edit.setStyleSheet(self._FIELD_STYLE)
+        self._max_edit.editingFinished.connect(self._on_range_changed)
+
+        slider_row.addWidget(self._min_edit)
+        slider_row.addWidget(self._slider)
+        slider_row.addWidget(self._max_edit)
+        outer.addLayout(slider_row)
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    @property
+    def param_name(self) -> str:
+        return self._name
+
+    def current_value(self) -> float:
+        return self._value
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _to_pos(self, v: float) -> int:
+        rng = self._max_val - self._min_val
+        if rng == 0.0:
+            return 500
+        return max(0, min(1000, int((v - self._min_val) / rng * 1000)))
+
+    def _to_value(self, pos: int) -> float:
+        return self._min_val + pos / 1000.0 * (self._max_val - self._min_val)
+
+    def _on_slider_moved(self, pos: int) -> None:
+        self._value = self._to_value(pos)
+        self._val_lbl.setText(f"{self._value:.5g}")
+        self.value_changed.emit(self._name, self._value)
+
+    def _on_range_changed(self) -> None:
+        try:
+            self._min_val = float(self._min_edit.text())
+        except ValueError:
+            self._min_edit.setText(f"{self._min_val:.3g}")
+        try:
+            self._max_val = float(self._max_edit.text())
+        except ValueError:
+            self._max_edit.setText(f"{self._max_val:.3g}")
+        # Reposition slider for current value without emitting
+        self._slider.blockSignals(True)
+        self._slider.setValue(self._to_pos(self._value))
+        self._slider.blockSignals(False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FitPanel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FitPanel(QWidget):
+    """Curve-fitting controls: trace selector, formula field, fit button, results.
+
+    Emits fit_requested(source_id, unit, expr_str) when the user confirms.
+    The caller is responsible for reading current_region() to get the time
+    window and for calling set_region() whenever the plot region changes.
+    """
+
+    fit_requested = pyqtSignal(str, str, str)   # source_id, unit, expr_str
+
+    _BTN_NEUTRAL = ("QPushButton { border:1px solid #3b82f6; border-radius:4px;"
+                    " color:#3b82f6; background:transparent; padding:3px 10px; }"
+                    " QPushButton:hover { background:rgba(59,130,246,0.08); }")
+    _BTN_OK      = ("QPushButton { border:none; border-radius:4px;"
+                    " color:white; background:#10b981; padding:3px 10px; }"
+                    " QPushButton:hover { background:#059669; }")
+    _BTN_ERR     = ("QPushButton { border:none; border-radius:4px;"
+                    " color:white; background:#ef4444; padding:3px 10px; }"
+                    " QPushButton:hover { background:#dc2626; }")
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(8, 4, 8, 4)
+        self._layout.setSpacing(4)
+
+        title = QLabel("CURVE FIT")
+        title.setStyleSheet("font-size:10px; font-weight:600; color:#9ca3af;"
+                            " letter-spacing:1px;")
+        self._layout.addWidget(title)
+
+        # Trace selector
+        self._trace_combo = QComboBox()
+        self._trace_combo.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                        QSizePolicy.Policy.Fixed)
+        self._layout.addWidget(self._trace_combo)
+
+        # Formula input — resets button to neutral on every edit
+        self._formula_edit = QLineEdit()
+        self._formula_edit.setPlaceholderText("e.g. A*(1-exp(-k*t))")
+        self._formula_edit.setStyleSheet(
+            "font-size:11px; font-family:Menlo,Monaco,'Courier New'; padding:2px 4px;")
+        self._formula_edit.returnPressed.connect(self._on_fit)
+        self._formula_edit.textChanged.connect(self._on_formula_changed)
+        self._layout.addWidget(self._formula_edit)
+
+        # Fit button (doubles as status indicator)
+        self._fit_btn = QPushButton("Fit")
+        self._fit_btn.setStyleSheet(self._BTN_NEUTRAL)
+        self._fit_btn.clicked.connect(self._on_fit)
+        self._layout.addWidget(self._fit_btn)
+
+        # Separator shown when results or error are displayed
+        self._status_sep = QFrame()
+        self._status_sep.setFrameShape(QFrame.Shape.HLine)
+        self._status_sep.setStyleSheet("color:#e5e7eb;")
+        self._status_sep.hide()
+        self._layout.addWidget(self._status_sep)
+
+        # Error label (hidden while showing param sliders)
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._status_lbl.hide()
+        self._layout.addWidget(self._status_lbl)
+
+        # Internal state
+        self._traces: list[tuple[str, str, str]] = []
+        self._t_min: float = 0.0
+        self._t_max: float = 10.0
+        self._editing_fit_id: str | None = None
+        self._param_rows: list[ParamSliderRow] = []
+        self._params_changed_cb = None   # callable(params: dict) | None
+
+    # ── External API ──────────────────────────────────────────────────────────
+
+    def set_traces(self, traces: list[tuple[str, str, str]]) -> None:
+        """Populate the trace dropdown: [(source_id, unit, display_name)]."""
+        prev_key = self._current_key()
+        self._traces = traces
+        self._trace_combo.blockSignals(True)
+        self._trace_combo.clear()
+        restore_idx = 0
+        for i, (sid, unit, name) in enumerate(traces):
+            self._trace_combo.addItem(name)
+            if prev_key and (sid, unit) == prev_key:
+                restore_idx = i
+        if traces:
+            self._trace_combo.setCurrentIndex(restore_idx)
+        self._trace_combo.blockSignals(False)
+
+    def set_region(self, t_min: float, t_max: float) -> None:
+        self._t_min = t_min
+        self._t_max = t_max
+
+    def current_region(self) -> tuple[float, float]:
+        return (self._t_min, self._t_max)
+
+    def set_params_changed_cb(self, cb) -> None:
+        """Set a callable(params: dict) called whenever a slider moves."""
+        self._params_changed_cb = cb
+
+    def set_result(self, params: dict, errors: dict) -> None:
+        self._fit_btn.setText("✓ Fitted")
+        self._fit_btn.setStyleSheet(self._BTN_OK)
+        self._status_lbl.hide()
+        self._clear_param_rows()
+        if params:
+            self._status_sep.show()
+            for name, val in params.items():
+                err = errors.get(name, float('nan'))
+                row = ParamSliderRow(name, val, err)
+                row.value_changed.connect(self._on_param_value_changed)
+                self._layout.addWidget(row)
+                self._param_rows.append(row)
+        else:
+            self._status_sep.hide()
+
+    def set_error(self, msg: str) -> None:
+        self._fit_btn.setText("✗ Error")
+        self._fit_btn.setStyleSheet(self._BTN_ERR)
+        self._clear_param_rows()
+        self._status_lbl.setStyleSheet("font-size:10px; color:#ef4444;")
+        self._status_lbl.setText(msg)
+        self._status_sep.show()
+        self._status_lbl.show()
+
+    def _clear_param_rows(self) -> None:
+        for row in self._param_rows:
+            self._layout.removeWidget(row)
+            row.setParent(None)
+            row.deleteLater()
+        self._param_rows.clear()
+
+    def _on_param_value_changed(self, _name: str, _value: float) -> None:
+        if self._params_changed_cb:
+            params = {row.param_name: row.current_value() for row in self._param_rows}
+            self._params_changed_cb(params)
+
+    def _on_formula_changed(self) -> None:
+        """Reset button to neutral and clear param rows whenever the formula changes."""
+        self._fit_btn.setText("Fit")
+        self._fit_btn.setStyleSheet(self._BTN_NEUTRAL)
+        self._clear_param_rows()
+        self._status_sep.hide()
+        self._status_lbl.hide()
+
+    def populate_for_edit(self, fit: FitResult) -> None:
+        """Pre-fill the panel to edit an existing fit."""
+        self._editing_fit_id = fit.id
+        # blockSignals so textChanged doesn't reset the button while populating
+        self._formula_edit.blockSignals(True)
+        self._formula_edit.setText(fit.expr_str)
+        self._formula_edit.blockSignals(False)
+        self.set_region(fit.t_min, fit.t_max)
+        for i, (sid, unit, _) in enumerate(self._traces):
+            if sid == fit.source_id and unit == fit.unit:
+                self._trace_combo.setCurrentIndex(i)
+                break
+        self.set_result(fit.params, fit.param_errors)
+
+    def clear_edit_state(self) -> None:
+        self._editing_fit_id = None
+
+    @property
+    def editing_fit_id(self) -> str | None:
+        return self._editing_fit_id
+
+    # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _current_key(self) -> tuple[str, str] | None:
+        idx = self._trace_combo.currentIndex()
+        if 0 <= idx < len(self._traces):
+            sid, unit, _ = self._traces[idx]
+            return (sid, unit)
+        return None
+
+    def _on_fit(self) -> None:
+        key = self._current_key()
+        if key is None:
+            self.set_error("No trace selected.")
+            return
+        expr = self._formula_edit.text().strip()
+        if not expr:
+            self.set_error("Enter a formula.")
+            return
+        self._fit_btn.setText("Fitting…")
+        self._fit_btn.setStyleSheet(self._BTN_NEUTRAL)
+        source_id, unit = key
+        self.fit_requested.emit(source_id, unit, expr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -949,6 +1352,16 @@ class MainWindow(QMainWindow):
 
         # ── Imported CSV runs ─────────────────────────────────────────────────
         self._imported_runs: list[ImportedRun] = []
+
+        # ── Curve fit results ─────────────────────────────────────────────────
+        self._fit_results:  list[FitResult] = []
+        self._fit_counter:  int  = 0
+        self._fit_mode:     bool = False
+        # Active fit function — updated in _do_fit / _rebuild_active_fit_fn
+        # so slider changes can recompute the curve without re-running scipy.
+        self._active_fit_fn          = None    # callable(t, *params) → np.array
+        self._active_fit_param_names: list[str] = []
+        self._active_fit_id:          str | None = None
 
         # ── Stable colour assignment for sessions and runs ─────────────────────
         self._color_idx: int = 0
@@ -1043,6 +1456,16 @@ class MainWindow(QMainWindow):
         self._download_btn.clicked.connect(self._on_download)
         tb.addWidget(self._download_btn)
 
+        tb.addSeparator()
+
+        # Curve fit toggle
+        self._fit_btn = QPushButton("∿ Fit")
+        self._fit_btn.setCheckable(True)
+        self._fit_btn.setToolTip("Enter curve fitting mode")
+        self._fit_btn.toggled.connect(self._on_fit_toggled)
+        self._fit_btn.setStyleSheet(self._fit_btn_style(False))
+        tb.addWidget(self._fit_btn)
+
         tb.addWidget(QWidget())   # right padding
 
     def _live_btn_style(self, active: bool) -> str:
@@ -1054,10 +1477,21 @@ class MainWindow(QMainWindow):
                 " color:#9ca3af; background:transparent; padding:4px 10px; }"
                 " QPushButton:hover { background:#f3f4f6; }")
 
+    def _fit_btn_style(self, active: bool) -> str:
+        if active:
+            return ("QPushButton { border:1px solid #8b5cf6; border-radius:4px;"
+                    " color:#8b5cf6; background:rgba(139,92,246,0.07); padding:4px 10px; }"
+                    " QPushButton:hover { background:rgba(139,92,246,0.15); }")
+        return ("QPushButton { border:1px solid #d1d5db; border-radius:4px;"
+                " color:#9ca3af; background:transparent; padding:4px 10px; }"
+                " QPushButton:hover { background:#f3f4f6; }")
+
     def _build_sidebar(self) -> None:
-        sidebar = QWidget()
-        sidebar.setFixedWidth(240)
-        v = QVBoxLayout(sidebar)
+        # All sidebar content lives in a scrollable inner widget so that the
+        # FitPanel (with dynamic param rows) is always reachable even when the
+        # session list is long.
+        content = QWidget()
+        v = QVBoxLayout(content)
         v.setContentsMargins(0, 4, 0, 4)
         v.setSpacing(0)
 
@@ -1084,17 +1518,42 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("color:#e5e7eb; margin:4px 8px;")
         v.addWidget(sep)
 
-        # Session panel
+        # Session panel — no stretch so it takes its natural height and doesn't
+        # squeeze the FitPanel below it.
         self._session_panel = SessionPanel()
         self._session_panel.remove_session_requested.connect(self._on_remove_session)
         self._session_panel.remove_run_requested.connect(self._on_remove_run)
+        self._session_panel.remove_fit_requested.connect(self._on_remove_fit)
         self._session_panel.connect_import_to(self._on_import_csv)
-        v.addWidget(self._session_panel, 1)
+        v.addWidget(self._session_panel)
+
+        # Fit panel (hidden until fit mode is activated)
+        self._fit_sep = QFrame()
+        self._fit_sep.setFrameShape(QFrame.Shape.HLine)
+        self._fit_sep.setStyleSheet("color:#e5e7eb; margin:4px 8px;")
+        self._fit_sep.hide()
+        v.addWidget(self._fit_sep)
+
+        self._fit_panel = FitPanel()
+        self._fit_panel.fit_requested.connect(self._on_fit_requested)
+        self._fit_panel.hide()
+        v.addWidget(self._fit_panel)
+
+        # Push everything to the top so empty space accumulates at the bottom.
+        v.addStretch(1)
+
+        # Wrap in a scroll area so dynamic content (param rows) is always reachable.
+        scroll = QScrollArea()
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedWidth(284)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
 
         dock = QDockWidget("Sensors & Data", self)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable |
                          QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        dock.setWidget(sidebar)
+        dock.setWidget(scroll)
         dock.setTitleBarWidget(QWidget())  # hide default title bar
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
 
@@ -1105,6 +1564,7 @@ class MainWindow(QMainWindow):
         v.setSpacing(4)
 
         self._plot_panel = PlotPanel()
+        self._plot_panel.fit_region_changed.connect(self._on_fit_region_changed)
         v.addWidget(self._plot_panel)
 
         self.setCentralWidget(central)
@@ -1135,6 +1595,10 @@ class MainWindow(QMainWindow):
         for r in self._imported_runs:
             if r.visible:
                 units.update(r.data.keys())
+
+        for r in self._fit_results:
+            if r.visible:
+                units.add(r.unit)
 
         unit_list = _sorted_units(units)
 
@@ -1191,6 +1655,7 @@ class MainWindow(QMainWindow):
             in_progress_labels   = self._rec_ctrl.in_progress_labels,
             in_progress_color_id = self._in_progress_color_id,
             live_labels          = live_labels,
+            fit_results          = self._fit_results,
         )
 
         # Set x-axis range whenever there are plots.
@@ -1414,6 +1879,360 @@ class MainWindow(QMainWindow):
             return
         data = self._rec_ctrl.build_csv(self._imported_runs)
         Path(path).write_bytes(data)
+
+    # ── Curve fitting ─────────────────────────────────────────────────────────
+
+    def _on_fit_toggled(self, checked: bool) -> None:
+        self._fit_mode = checked
+        self._fit_btn.setStyleSheet(self._fit_btn_style(checked))
+        if checked:
+            self._fit_sep.show()
+            self._fit_panel.show()
+            self._update_fit_traces()
+            # Initialise region to the centre quarter of the current viewport.
+            rng = self._plot_panel.get_x_range()
+            if rng:
+                cx = (rng[0] + rng[1]) / 2.0
+                w  = (rng[1] - rng[0]) / 4.0
+                t_min, t_max = cx - w, cx + w
+            else:
+                t_min, t_max = 0.0, 5.0
+            self._fit_panel.set_region(t_min, t_max)
+            self._plot_panel.show_fit_region(t_min, t_max)
+        else:
+            self._fit_sep.hide()
+            self._fit_panel.hide()
+            self._plot_panel.hide_fit_region()
+            self._fit_panel.clear_edit_state()
+
+    def _on_fit_region_changed(self, t_min: float, t_max: float) -> None:
+        self._fit_panel.set_region(t_min, t_max)
+
+    def _update_fit_traces(self) -> None:
+        """Rebuild the FitPanel trace dropdown from all recorded/imported data."""
+        traces: list[tuple[str, str, str]] = []
+        for session in self._rec_ctrl.sessions:
+            for unit in session.data:
+                traces.append((session.id, unit,
+                               f"{session.label} ({unit})"))
+        for run in self._imported_runs:
+            for unit in run.data:
+                traces.append((run.id, unit,
+                               f"{run.label} ({unit})"))
+        self._fit_panel.set_traces(traces)
+
+    def _get_trace_data(
+        self, source_id: str, unit: str
+    ) -> tuple[list[float], list[float]] | None:
+        """Return (times, values) for the given trace id and unit."""
+        for session in self._rec_ctrl.sessions:
+            if session.id == source_id and unit in session.data:
+                sensor_map = session.data[unit]
+                pts_all = [(t, v) for pts in sensor_map.values() for t, v in pts]
+                pts_all.sort()
+                return [p[0] for p in pts_all], [p[1] for p in pts_all]
+        for run in self._imported_runs:
+            if run.id == source_id and unit in run.data:
+                series = run.data[unit]
+                return series["times"], series["values"]
+        return None
+
+    def _on_fit_requested(self, source_id: str, unit: str, expr_str: str) -> None:
+        try:
+            self._do_fit(source_id, unit, expr_str)
+        except Exception as exc:
+            self._fit_panel.set_error(f"Unexpected error: {exc}")
+
+    def _do_fit(self, source_id: str, unit: str, expr_str: str) -> None:
+        import numpy as np
+        from sympy import Symbol, lambdify
+        from sympy.parsing.sympy_parser import parse_expr, standard_transformations
+        from scipy.optimize import curve_fit
+
+        # Strip optional "LHS =" prefix so users can type "I(t) = ..." naturally.
+        if "=" in expr_str:
+            expr_str = expr_str.split("=", 1)[1].strip()
+
+        t_min, t_max = self._fit_panel.current_region()
+
+        # 1. Get and filter data
+        data = self._get_trace_data(source_id, unit)
+        if data is None:
+            self._fit_panel.set_error("Trace not found.")
+            return
+        t_all, v_all = data
+        ts = [t for t in t_all if t_min <= t <= t_max]
+        vs = [v for t, v in zip(t_all, v_all) if t_min <= t <= t_max]
+        if len(ts) < 2:
+            self._fit_panel.set_error("Not enough data points in selection.")
+            return
+
+        # 2. Parse expression
+        # Note: implicit_multiplication_application is intentionally NOT used because
+        # it breaks variable names containing digits (e.g. U0 → U*0 = 0).
+        # Users must write explicit '*' for multiplication.
+        # convert_xor lets users write '^' for exponentiation.
+        try:
+            from sympy.parsing.sympy_parser import convert_xor
+            transforms = standard_transformations + (convert_xor,)
+            t_sym = Symbol("t")
+            expr  = parse_expr(expr_str, transformations=transforms)
+            free  = sorted(expr.free_symbols - {t_sym}, key=lambda s: s.name)
+            param_names = [str(s) for s in free]
+            f_np = lambdify([t_sym] + free, expr, "numpy")
+        except Exception as exc:
+            self._fit_panel.set_error(f"Parse error: {exc}")
+            return
+
+        # 3. Fit (or evaluate directly if no free parameters)
+        ts_arr = np.asarray(ts, dtype=float)
+        vs_arr = np.asarray(vs, dtype=float)
+        params: dict = {}
+        param_errors: dict = {}
+        popt: list = []
+
+        def _safe_eval(f_np, t, *args):
+            """Call lambdified function and guarantee a same-shape numpy array."""
+            result = f_np(t, *args)
+            return np.broadcast_to(np.asarray(result, dtype=float), np.shape(t)).copy()
+
+        if param_names:
+            def fit_fn(t, *args):
+                return _safe_eval(f_np, t, *args)
+
+            def residual_cost(p):
+                try:
+                    r = fit_fn(ts_arr, *p) - vs_arr
+                    c = float(np.sum(r * r))
+                    return c if np.isfinite(c) else 1e30
+                except Exception:
+                    return 1e30
+
+            # Phase 1 — multi-start Levenberg-Marquardt over ~50 starting points.
+            # Each LM run is cheap; keeping the best residual avoids local minima.
+            p0_candidates = self._starting_points(param_names, ts_arr, vs_arr)
+            best_cost = np.inf
+            best_popt = None
+            best_pcov = None
+            for p0 in p0_candidates:
+                try:
+                    po, pc = curve_fit(
+                        fit_fn, ts_arr, vs_arr, p0=p0, maxfev=5_000,
+                        ftol=1e-10, xtol=1e-10)
+                    res = residual_cost(po)
+                    if res < best_cost:
+                        best_cost, best_popt, best_pcov = res, po, pc
+                except Exception:
+                    continue
+
+            # Phase 2 — Nelder-Mead (derivative-free) starting from the best LM
+            # result or the best single starting point if LM found nothing.  This
+            # catches cases where LM is trapped by a poorly-conditioned Jacobian.
+            from scipy.optimize import minimize
+            nm_seed = (best_popt if best_popt is not None
+                       else min(p0_candidates, key=residual_cost))
+            try:
+                nm = minimize(residual_cost, nm_seed, method='Nelder-Mead',
+                              options={'maxiter': 20_000, 'xatol': 1e-9, 'fatol': 1e-9,
+                                       'adaptive': True})
+                if nm.fun < best_cost:
+                    # Nelder-Mead found something better — run one LM pass from
+                    # that point to get a proper covariance estimate.
+                    try:
+                        po, pc = curve_fit(
+                            fit_fn, ts_arr, vs_arr, p0=nm.x, maxfev=5_000,
+                            ftol=1e-10, xtol=1e-10)
+                        res = residual_cost(po)
+                        if res <= nm.fun * 1.01:   # LM didn't diverge
+                            best_cost, best_popt, best_pcov = res, po, pc
+                        else:
+                            # Keep NM result; approximate covariance from finite diff
+                            best_cost = nm.fun
+                            best_popt = nm.x
+                            best_pcov = np.diag(np.abs(nm.x) * 0.1 + 1e-8)
+                    except Exception:
+                        best_cost = nm.fun
+                        best_popt = nm.x
+                        best_pcov = np.diag(np.abs(nm.x) * 0.1 + 1e-8)
+            except Exception:
+                pass
+
+            if best_popt is None:
+                self._fit_panel.set_error(
+                    "Fit did not converge from any starting point.\n"
+                    "Try a different formula or a wider time window.")
+                return
+
+            perr = np.sqrt(np.abs(np.diag(best_pcov))).tolist()
+            popt         = best_popt.tolist()
+            params       = dict(zip(param_names, popt))
+            param_errors = dict(zip(param_names, perr))
+        else:
+            # No free parameters — overlay the function as-is.
+            def fit_fn(t):
+                return _safe_eval(f_np, t)
+
+        # 4. Compute dense fit curve (always an array)
+        t_dense = np.linspace(t_min, t_max, 300)
+        v_dense = np.asarray(
+            fit_fn(t_dense, *popt) if param_names else fit_fn(t_dense),
+            dtype=float,
+        )
+
+        # 5. Create or replace FitResult
+        editing_id = self._fit_panel.editing_fit_id
+        if editing_id:
+            old = next((r for r in self._fit_results if r.id == editing_id), None)
+            fit_id    = editing_id
+            fit_label = old.label if old else f"Fit {self._fit_counter}"
+            self._fit_results = [r for r in self._fit_results if r.id != editing_id]
+            self._session_panel.remove_entry(editing_id)
+            # Keep existing color — do not pop from _color_map.
+        else:
+            self._fit_counter += 1
+            fit_id    = f"fit_{self._fit_counter}"
+            fit_label = f"Fit {self._fit_counter}"
+
+        fit = FitResult(
+            id=fit_id, label=fit_label, unit=unit,
+            t_min=t_min, t_max=t_max, expr_str=expr_str,
+            source_id=source_id, params=params, param_errors=param_errors,
+            t_array=t_dense.tolist(), v_array=v_dense.tolist(),
+        )
+        self._fit_results.append(fit)
+        self._assign_color(fit_id)
+        self._session_panel.add_entry(
+            fit_id, f"ƒ {fit_label}",
+            on_toggle=self._on_toggle_fit,
+            on_edit=self._on_edit_fit,
+        )
+
+        # Store the fit function so slider changes can update the curve live.
+        if param_names:
+            self._active_fit_fn = fit_fn
+        else:
+            self._active_fit_fn = None
+        self._active_fit_param_names = param_names
+        self._active_fit_id = fit_id
+        self._fit_panel.set_params_changed_cb(self._on_fit_params_adjusted)
+
+        self._fit_panel.set_result(params, param_errors)
+        self._fit_panel.clear_edit_state()
+
+    def _starting_points(
+        self,
+        param_names: list[str],
+        ts_arr,
+        vs_arr,
+    ) -> list:
+        """Return starting-point arrays for multi-start optimisation.
+
+        Builds data-informed seeds (amplitude, time-constant, their ratios)
+        plus a large grid of log-uniform random draws so that the optimizer
+        can explore many scales without any domain knowledge.
+        """
+        import numpy as np
+        n = len(param_names)
+        v_amp   = max(float(np.max(np.abs(vs_arr))), 1e-6)
+        v_std   = max(float(np.std(vs_arr)), 1e-6)
+        v_mean  = float(np.mean(vs_arr))
+        t_range = max(float(ts_arr[-1] - ts_arr[0]), 1e-6)
+        t_mid   = float(ts_arr[len(ts_arr)//2])
+        k_est   = 3.0 / t_range     # time-constant guess (e-fold in ~1/3 window)
+
+        # Data-informed seeds — cover amplitude-like and rate-like scales
+        deterministic = [
+            np.ones(n),
+            np.full(n, v_amp),
+            np.full(n, v_std),
+            np.full(n, k_est),
+            np.full(n, v_amp * k_est),
+            np.full(n, 1.0 / t_range),
+            np.full(n, v_mean) if abs(v_mean) > 1e-9 else np.full(n, v_amp),
+            # mixed: alternate amplitude / rate per parameter
+            np.array([v_amp if i % 2 == 0 else k_est for i in range(n)]),
+            np.array([k_est if i % 2 == 0 else v_amp for i in range(n)]),
+        ]
+
+        # Log-uniform random draws with both signs (deterministic seed → reproducible)
+        rng = np.random.RandomState(42)
+        random_pts = []
+        for _ in range(50):
+            signs = rng.choice([-1.0, 1.0], size=n)
+            mags  = 10.0 ** rng.uniform(-4.0, 4.0, size=n)
+            random_pts.append(signs * mags)
+
+        return deterministic + random_pts
+
+    def _on_edit_fit(self, fit_id: str) -> None:
+        fit = next((r for r in self._fit_results if r.id == fit_id), None)
+        if fit is None:
+            return
+        if not self._fit_mode:
+            self._fit_btn.setChecked(True)   # triggers _on_fit_toggled
+        self._update_fit_traces()
+        self._fit_panel.populate_for_edit(fit)
+        self._plot_panel.show_fit_region(fit.t_min, fit.t_max)
+        # Rebuild active fit function so sliders update the curve immediately.
+        self._rebuild_active_fit_fn(fit)
+        self._fit_panel.set_params_changed_cb(self._on_fit_params_adjusted)
+
+    def _rebuild_active_fit_fn(self, fit: FitResult) -> None:
+        """Reconstruct the numpy fit function from a stored FitResult's expr_str."""
+        try:
+            import numpy as np
+            from sympy import Symbol, lambdify
+            from sympy.parsing.sympy_parser import (
+                parse_expr, standard_transformations, convert_xor,
+            )
+            expr_str = fit.expr_str
+            if "=" in expr_str:
+                expr_str = expr_str.split("=", 1)[1].strip()
+            transforms = standard_transformations + (convert_xor,)
+            t_sym  = Symbol("t")
+            expr   = parse_expr(expr_str, transformations=transforms)
+            free   = sorted(expr.free_symbols - {t_sym}, key=lambda s: s.name)
+            f_np   = lambdify([t_sym] + free, expr, "numpy")
+            param_names = [str(s) for s in free]
+
+            def _fn(t, *args):
+                result = f_np(t, *args)
+                return np.broadcast_to(np.asarray(result, dtype=float), np.shape(t)).copy()
+
+            self._active_fit_fn          = _fn
+            self._active_fit_param_names = param_names
+            self._active_fit_id          = fit.id
+        except Exception:
+            self._active_fit_fn = None
+
+    def _on_fit_params_adjusted(self, params: dict) -> None:
+        """Called by FitPanel when the user moves a parameter slider."""
+        import numpy as np
+        fit = next((r for r in self._fit_results if r.id == self._active_fit_id), None)
+        if fit is None or self._active_fit_fn is None:
+            return
+        try:
+            popt    = [params[n] for n in self._active_fit_param_names]
+            t_dense = np.linspace(fit.t_min, fit.t_max, 300)
+            v_dense = self._active_fit_fn(t_dense, *popt)
+            fit.t_array = t_dense.tolist()
+            fit.v_array = np.asarray(v_dense, dtype=float).tolist()
+            # Also update stored params so they survive a re-edit.
+            fit.params = {n: float(v) for n, v in params.items()}
+            managed = self._ble.managed_addrs if self._ble else frozenset()
+            self._refresh_plot(managed)
+        except Exception:
+            pass
+
+    def _on_toggle_fit(self, fit_id: str, visible: bool) -> None:
+        for r in self._fit_results:
+            if r.id == fit_id:
+                r.visible = visible
+                break
+
+    def _on_remove_fit(self, fit_id: str) -> None:
+        self._fit_results = [r for r in self._fit_results if r.id != fit_id]
+        self._color_map.pop(fit_id, None)
 
     # ── Color assignment ──────────────────────────────────────────────────────
 

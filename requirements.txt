@@ -4,3 +4,5 @@ pandas>=2.3
 numpy>=2.4
 pasco==0.3.65
 bleak
+sympy>=1.12
+scipy>=1.11
