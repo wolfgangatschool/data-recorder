@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pyqtgraph as pg
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QFont
+from PyQt6.QtGui import QColor, QFont, QPalette
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QDockWidget, QFileDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QPushButton, QScrollArea,
@@ -80,6 +80,208 @@ _TIME_RE = re.compile(r"^Time\s*\((.+?)\)\s*Run\s*(\d+)$",  re.IGNORECASE)
 def _sorted_units(units: set[str]) -> list[str]:
     return ([u for u in _UNIT_ORDER if u in units] +
             [u for u in sorted(units) if u not in _UNIT_ORDER])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Theme / palette helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Palette:
+    """Semantic color tokens derived from the current Qt palette.
+
+    Call _Palette.refresh() whenever the system theme may have changed.
+    All stylesheet helpers read from the singleton so the rest of the code
+    never has to branch on dark vs. light.
+    """
+
+    # Accent / status colors are the same in both themes.
+    BLUE        = "#3b82f6"
+    GREEN       = "#10b981"
+    GREEN_DARK  = "#059669"
+    RED         = "#ef4444"
+    RED_DARK    = "#dc2626"
+    VIOLET      = "#8b5cf6"
+
+    # Semantic tokens — set by refresh()
+    is_dark         : bool  = True
+
+    # Text
+    text_primary    : str = "#e5e7eb"
+    text_secondary  : str = "#9ca3af"
+    text_muted      : str = "#6b7280"
+    text_on_accent  : str = "#ffffff"
+
+    # Surfaces
+    bg_window       : str = "#1e1e1e"
+    bg_base         : str = "#171717"
+    bg_input        : str = "#262626"
+
+    # Borders / dividers
+    border          : str = "#374151"
+    divider         : str = "#374151"
+
+    # Interactive elements (neutral / unfocused)
+    btn_border      : str = "#4b5563"
+    btn_text        : str = "#9ca3af"
+    btn_hover_bg    : str = "#2d2d2d"
+
+    # Hover tints for danger/safe actions
+    hover_danger    : str = "#450a0a"
+    hover_safe      : str = "#052e16"
+
+    @classmethod
+    def refresh(cls) -> None:
+        """Read the live Qt palette and update all tokens."""
+        app = QApplication.instance()
+        if app is None:
+            return
+        win_color = app.palette().color(QPalette.ColorRole.Window)
+        cls.is_dark = win_color.lightness() < 128
+
+        if cls.is_dark:
+            cls.text_primary   = "#e5e7eb"
+            cls.text_secondary = "#9ca3af"
+            cls.text_muted     = "#6b7280"
+            cls.text_on_accent = "#ffffff"
+            cls.bg_window      = win_color.name()
+            cls.bg_base        = app.palette().color(QPalette.ColorRole.Base).name()
+            cls.bg_input       = "#262626"
+            cls.border         = "#374151"
+            cls.divider        = "#374151"
+            cls.btn_border     = "#4b5563"
+            cls.btn_text       = "#9ca3af"
+            cls.btn_hover_bg   = "#2d2d2d"
+            cls.hover_danger   = "#450a0a"
+            cls.hover_safe     = "#052e16"
+        else:
+            cls.text_primary   = "#111827"
+            cls.text_secondary = "#374151"
+            cls.text_muted     = "#6b7280"
+            cls.text_on_accent = "#ffffff"
+            cls.bg_window      = win_color.name()
+            cls.bg_base        = app.palette().color(QPalette.ColorRole.Base).name()
+            cls.bg_input       = "#f9fafb"
+            cls.border         = "#e5e7eb"
+            cls.divider        = "#e5e7eb"
+            cls.btn_border     = "#d1d5db"
+            cls.btn_text       = "#374151"
+            cls.btn_hover_bg   = "#f3f4f6"
+            cls.hover_danger   = "#fee2e2"
+            cls.hover_safe     = "#d1fae5"
+
+    # ── Stylesheet fragments ──────────────────────────────────────────────────
+
+    @classmethod
+    def section_title(cls) -> str:
+        return (f"font-size:10px; font-weight:600; color:{cls.text_muted};"
+                " letter-spacing:1px;")
+
+    @classmethod
+    def label_secondary(cls) -> str:
+        return f"font-size:10px; color:{cls.text_muted};"
+
+    @classmethod
+    def label_primary(cls) -> str:
+        return f"font-size:10px; color:{cls.text_primary};"
+
+    @classmethod
+    def label_bold(cls) -> str:
+        return f"font-size:10px; font-weight:600; color:{cls.text_primary};"
+
+    @classmethod
+    def label_error(cls) -> str:
+        return f"font-size:10px; color:{cls.RED};"
+
+    @classmethod
+    def label_monospace(cls) -> str:
+        return (f"font-size:10px; font-family:Menlo,Monaco,'Courier New';"
+                f" color:{cls.text_primary};")
+
+    @classmethod
+    def divider_style(cls) -> str:
+        return f"color:{cls.divider};"
+
+    @classmethod
+    def divider_margin(cls) -> str:
+        return f"color:{cls.divider}; margin:4px 8px;"
+
+    @classmethod
+    def toolbar_style(cls) -> str:
+        return f"QToolBar {{ border-bottom:1px solid {cls.border}; spacing:6px; }}"
+
+    @classmethod
+    def scroll_area(cls) -> str:
+        return "QScrollArea { border: none; }"
+
+    @classmethod
+    def neutral_btn(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.btn_border}; border-radius:4px;"
+                f" color:{cls.btn_text}; background:transparent; padding:4px 10px; }}"
+                f" QPushButton:hover {{ background:{cls.btn_hover_bg}; }}")
+
+    @classmethod
+    def neutral_btn_small(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.btn_border}; border-radius:4px;"
+                f" color:{cls.btn_text}; background:transparent; padding:2px 6px;"
+                f" font-size:10px; }}"
+                f" QPushButton:hover {{ background:{cls.btn_hover_bg}; }}")
+
+    @classmethod
+    def danger_btn_small(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.btn_border}; border-radius:4px;"
+                f" color:{cls.RED}; background:transparent; padding:2px 6px;"
+                f" font-size:10px; }}"
+                f" QPushButton:hover {{ background:{cls.hover_danger}; }}")
+
+    @classmethod
+    def accent_btn_small(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.BLUE}; border-radius:4px;"
+                f" color:{cls.BLUE}; background:transparent; padding:2px 6px;"
+                f" font-size:10px; }}"
+                f" QPushButton:hover {{ background:rgba(59,130,246,0.12); }}")
+
+    @classmethod
+    def active_live_btn(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.GREEN}; border-radius:4px;"
+                f" color:{cls.GREEN}; background:rgba(16,185,129,0.07); padding:4px 10px; }}"
+                f" QPushButton:hover {{ background:rgba(16,185,129,0.15); }}")
+
+    @classmethod
+    def active_fit_btn(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.VIOLET}; border-radius:4px;"
+                f" color:{cls.VIOLET}; background:rgba(139,92,246,0.07); padding:4px 10px; }}"
+                f" QPushButton:hover {{ background:rgba(139,92,246,0.15); }}")
+
+    @classmethod
+    def fit_btn_neutral(cls) -> str:
+        return (f"QPushButton {{ border:1px solid {cls.BLUE}; border-radius:4px;"
+                f" color:{cls.BLUE}; background:transparent; padding:3px 10px; }}"
+                f" QPushButton:hover {{ background:rgba(59,130,246,0.12); }}")
+
+    @classmethod
+    def fit_btn_ok(cls) -> str:
+        return (f"QPushButton {{ border:none; border-radius:4px;"
+                f" color:{cls.text_on_accent}; background:{cls.GREEN}; padding:3px 10px; }}"
+                f" QPushButton:hover {{ background:{cls.GREEN_DARK}; }}")
+
+    @classmethod
+    def fit_btn_err(cls) -> str:
+        return (f"QPushButton {{ border:none; border-radius:4px;"
+                f" color:{cls.text_on_accent}; background:{cls.RED}; padding:3px 10px; }}"
+                f" QPushButton:hover {{ background:{cls.RED_DARK}; }}")
+
+    @classmethod
+    def input_field(cls) -> str:
+        return (f"font-size:11px; font-family:Menlo,Monaco,'Courier New';"
+                f" padding:2px 4px;"
+                f" background:{cls.bg_input}; color:{cls.text_primary};"
+                f" border:1px solid {cls.border}; border-radius:3px;")
+
+    @classmethod
+    def small_field(cls) -> str:
+        return (f"font-size:9px; padding:1px 2px;"
+                f" background:{cls.bg_input}; color:{cls.text_primary};"
+                f" border:1px solid {cls.border}; border-radius:2px;")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -622,21 +824,18 @@ class SensorPanel(QWidget):
 
         # Section title
         title = QLabel("LIVE SENSORS")
-        title.setStyleSheet("font-size:10px; font-weight:600; color:#9ca3af;"
-                            " letter-spacing:1px;")
+        title.setStyleSheet(_Palette.section_title())
         layout.addWidget(title)
 
         # Scan status + refresh row
         scan_row = QHBoxLayout()
         self._scan_label = QLabel("No scan yet")
-        self._scan_label.setStyleSheet("font-size:11px; color:#6b7280;")
+        self._scan_label.setStyleSheet(_Palette.label_secondary())
         scan_row.addWidget(self._scan_label, 1)
         self._refresh_btn = QPushButton("↺")
         self._refresh_btn.setFixedWidth(30)
         self._refresh_btn.setToolTip("Scan for sensors now")
-        self._refresh_btn.setStyleSheet("QPushButton { border: 1px solid #d1d5db;"
-                                        " border-radius:4px; padding:2px; }"
-                                        " QPushButton:hover { background:#f3f4f6; }")
+        self._refresh_btn.setStyleSheet(_Palette.neutral_btn_small())
         scan_row.addWidget(self._refresh_btn)
         layout.addLayout(scan_row)
 
@@ -649,16 +848,14 @@ class SensorPanel(QWidget):
         self._connect_btn = QPushButton("＋")
         self._connect_btn.setFixedWidth(30)
         self._connect_btn.setToolTip("Connect selected sensor")
-        self._connect_btn.setStyleSheet("QPushButton { border: 1px solid #d1d5db;"
-                                        " border-radius:4px; padding:2px; }"
-                                        " QPushButton:hover { background:#f3f4f6; }")
+        self._connect_btn.setStyleSheet(_Palette.neutral_btn_small())
         dropdown_row.addWidget(self._connect_btn)
         layout.addLayout(dropdown_row)
 
         # Divider
         self._divider = QFrame()
         self._divider.setFrameShape(QFrame.Shape.HLine)
-        self._divider.setStyleSheet("color:#e5e7eb;")
+        self._divider.setStyleSheet(_Palette.divider_style())
         self._divider.hide()
         layout.addWidget(self._divider)
 
@@ -752,16 +949,14 @@ class SensorPanel(QWidget):
 
         status_lbl = QLabel("connecting…")
         status_lbl.setObjectName(f"status_{addr}")
-        status_lbl.setStyleSheet("font-size:10px; color:#6b7280;")
+        status_lbl.setStyleSheet(_Palette.label_secondary())
         h.addWidget(status_lbl)
 
         disc_btn = QPushButton("－")
         disc_btn.setObjectName(f"disc_{addr}")
         disc_btn.setFixedWidth(26)
         disc_btn.setToolTip("Disconnect")
-        disc_btn.setStyleSheet("QPushButton { border: 1px solid #d1d5db;"
-                               " border-radius:4px; padding:2px; }"
-                               " QPushButton:hover { background:#fee2e2; }")
+        disc_btn.setStyleSheet(_Palette.danger_btn_small())
         disc_btn.clicked.connect(lambda _, a=addr: self.disconnect_requested.emit(a))
         h.addWidget(disc_btn)
 
@@ -825,8 +1020,7 @@ class RatePanel(QWidget):
         layout.setSpacing(4)
 
         title = QLabel("SAMPLE RATE")
-        title.setStyleSheet("font-size:10px; font-weight:600; color:#9ca3af;"
-                            " letter-spacing:1px;")
+        title.setStyleSheet(_Palette.section_title())
         layout.addWidget(title)
 
         # ◀ label ▶ row
@@ -835,21 +1029,17 @@ class RatePanel(QWidget):
 
         self._prev_btn = QPushButton("◀")
         self._prev_btn.setFixedWidth(28)
-        self._prev_btn.setStyleSheet("QPushButton { border:1px solid #d1d5db;"
-                                     " border-radius:4px; padding:2px; }"
-                                     " QPushButton:hover { background:#f3f4f6; }")
+        self._prev_btn.setStyleSheet(_Palette.neutral_btn_small())
         row.addWidget(self._prev_btn)
 
         self._rate_lbl = QLabel(_fmt_rate(_RATE_DEFAULT))
         self._rate_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._rate_lbl.setStyleSheet("font-size:12px; font-weight:600;")
+        self._rate_lbl.setStyleSheet(f"font-size:12px; font-weight:600; color:{_Palette.text_primary};")
         row.addWidget(self._rate_lbl, 1)
 
         self._next_btn = QPushButton("▶")
         self._next_btn.setFixedWidth(28)
-        self._next_btn.setStyleSheet("QPushButton { border:1px solid #d1d5db;"
-                                     " border-radius:4px; padding:2px; }"
-                                     " QPushButton:hover { background:#f3f4f6; }")
+        self._next_btn.setStyleSheet(_Palette.neutral_btn_small())
         row.addWidget(self._next_btn)
 
         layout.addLayout(row)
@@ -904,13 +1094,10 @@ class SessionPanel(QWidget):
         # Section title + import button row
         top_row = QHBoxLayout()
         title = QLabel("MEASUREMENTS")
-        title.setStyleSheet("font-size:10px; font-weight:600; color:#9ca3af;"
-                            " letter-spacing:1px;")
+        title.setStyleSheet(_Palette.section_title())
         top_row.addWidget(title, 1)
         self._import_btn = QPushButton("Load CSV…")
-        self._import_btn.setStyleSheet("QPushButton { font-size:10px; border:1px solid #d1d5db;"
-                                       " border-radius:4px; padding:2px 6px; }"
-                                       " QPushButton:hover { background:#f3f4f6; }")
+        self._import_btn.setStyleSheet(_Palette.neutral_btn_small())
         top_row.addWidget(self._import_btn)
         layout.addLayout(top_row)
 
@@ -952,18 +1139,13 @@ class SessionPanel(QWidget):
             edit_btn = QPushButton("✏")
             edit_btn.setFixedWidth(22)
             edit_btn.setToolTip("Edit fit")
-            edit_btn.setStyleSheet(
-                "QPushButton { border:1px solid #d1d5db; border-radius:4px;"
-                " padding:1px; font-size:10px; }"
-                " QPushButton:hover { background:#eff6ff; }")
+            edit_btn.setStyleSheet(_Palette.accent_btn_small())
             edit_btn.clicked.connect(lambda _, eid=entry_id: on_edit(eid))
             h.addWidget(edit_btn)
 
         remove_btn = QPushButton("－")
         remove_btn.setFixedWidth(22)
-        remove_btn.setStyleSheet("QPushButton { border:1px solid #d1d5db; border-radius:4px;"
-                                 " padding:1px; font-size:10px; }"
-                                 " QPushButton:hover { background:#fee2e2; }")
+        remove_btn.setStyleSheet(_Palette.danger_btn_small())
         remove_btn.clicked.connect(lambda _, eid=entry_id: self._on_remove(eid))
         h.addWidget(remove_btn)
 
@@ -1021,11 +1203,6 @@ class ParamSliderRow(QWidget):
 
     value_changed = pyqtSignal(str, float)   # param_name, new_value
 
-    _FIELD_STYLE  = "font-size:9px; padding:1px 2px;"
-    _LABEL_STYLE  = "font-size:10px; font-weight:600; color:#1f2937;"
-    _VALUE_STYLE  = "font-size:10px; font-family:Menlo,Monaco,'Courier New'; color:#1f2937;"
-    _ERR_STYLE    = "font-size:9px; color:#6b7280;"
-
     def __init__(self, name: str, value: float, error: float, parent=None) -> None:
         super().__init__(parent)
         self._name  = name
@@ -1044,9 +1221,9 @@ class ParamSliderRow(QWidget):
         top.setContentsMargins(0, 0, 0, 0)
         top.setSpacing(4)
         name_lbl = QLabel(name)
-        name_lbl.setStyleSheet(self._LABEL_STYLE)
+        name_lbl.setStyleSheet(_Palette.label_bold())
         self._val_lbl = QLabel(f"{value:.5g}")
-        self._val_lbl.setStyleSheet(self._VALUE_STYLE)
+        self._val_lbl.setStyleSheet(_Palette.label_monospace())
         self._val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         top.addWidget(name_lbl)
         top.addWidget(self._val_lbl)
@@ -1056,7 +1233,7 @@ class ParamSliderRow(QWidget):
         import math
         if not math.isnan(error):
             err_lbl = QLabel(f"± {error:.2g}")
-            err_lbl.setStyleSheet(self._ERR_STYLE)
+            err_lbl.setStyleSheet(_Palette.label_secondary())
             outer.addWidget(err_lbl)
 
         # ── Slider row: [min] ────slider──── [max] ────────────────────────────
@@ -1066,7 +1243,7 @@ class ParamSliderRow(QWidget):
 
         self._min_edit = QLineEdit(f"{self._min_val:.3g}")
         self._min_edit.setFixedWidth(52)
-        self._min_edit.setStyleSheet(self._FIELD_STYLE)
+        self._min_edit.setStyleSheet(_Palette.small_field())
         self._min_edit.editingFinished.connect(self._on_range_changed)
 
         self._slider = QSlider(Qt.Orientation.Horizontal)
@@ -1076,7 +1253,7 @@ class ParamSliderRow(QWidget):
 
         self._max_edit = QLineEdit(f"{self._max_val:.3g}")
         self._max_edit.setFixedWidth(52)
-        self._max_edit.setStyleSheet(self._FIELD_STYLE)
+        self._max_edit.setStyleSheet(_Palette.small_field())
         self._max_edit.editingFinished.connect(self._on_range_changed)
 
         slider_row.addWidget(self._min_edit)
@@ -1138,15 +1315,12 @@ class FitPanel(QWidget):
 
     fit_requested = pyqtSignal(str, str, str)   # source_id, unit, expr_str
 
-    _BTN_NEUTRAL = ("QPushButton { border:1px solid #3b82f6; border-radius:4px;"
-                    " color:#3b82f6; background:transparent; padding:3px 10px; }"
-                    " QPushButton:hover { background:rgba(59,130,246,0.08); }")
-    _BTN_OK      = ("QPushButton { border:none; border-radius:4px;"
-                    " color:white; background:#10b981; padding:3px 10px; }"
-                    " QPushButton:hover { background:#059669; }")
-    _BTN_ERR     = ("QPushButton { border:none; border-radius:4px;"
-                    " color:white; background:#ef4444; padding:3px 10px; }"
-                    " QPushButton:hover { background:#dc2626; }")
+    @property
+    def _BTN_NEUTRAL(self): return _Palette.fit_btn_neutral()
+    @property
+    def _BTN_OK(self):      return _Palette.fit_btn_ok()
+    @property
+    def _BTN_ERR(self):     return _Palette.fit_btn_err()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1155,8 +1329,7 @@ class FitPanel(QWidget):
         self._layout.setSpacing(4)
 
         title = QLabel("CURVE FIT")
-        title.setStyleSheet("font-size:10px; font-weight:600; color:#9ca3af;"
-                            " letter-spacing:1px;")
+        title.setStyleSheet(_Palette.section_title())
         self._layout.addWidget(title)
 
         # Trace selector
@@ -1168,8 +1341,7 @@ class FitPanel(QWidget):
         # Formula input — resets button to neutral on every edit
         self._formula_edit = QLineEdit()
         self._formula_edit.setPlaceholderText("e.g. A*(1-exp(-k*t))")
-        self._formula_edit.setStyleSheet(
-            "font-size:11px; font-family:Menlo,Monaco,'Courier New'; padding:2px 4px;")
+        self._formula_edit.setStyleSheet(_Palette.input_field())
         self._formula_edit.returnPressed.connect(self._on_fit)
         self._formula_edit.textChanged.connect(self._on_formula_changed)
         self._layout.addWidget(self._formula_edit)
@@ -1183,7 +1355,7 @@ class FitPanel(QWidget):
         # Separator shown when results or error are displayed
         self._status_sep = QFrame()
         self._status_sep.setFrameShape(QFrame.Shape.HLine)
-        self._status_sep.setStyleSheet("color:#e5e7eb;")
+        self._status_sep.setStyleSheet(_Palette.divider_style())
         self._status_sep.hide()
         self._layout.addWidget(self._status_sep)
 
@@ -1251,7 +1423,7 @@ class FitPanel(QWidget):
         self._fit_btn.setText("✗ Error")
         self._fit_btn.setStyleSheet(self._BTN_ERR)
         self._clear_param_rows()
-        self._status_lbl.setStyleSheet("font-size:10px; color:#ef4444;")
+        self._status_lbl.setStyleSheet(_Palette.label_error())
         self._status_lbl.setText(msg)
         self._status_sep.show()
         self._status_lbl.show()
@@ -1398,9 +1570,13 @@ class MainWindow(QMainWindow):
         self._expected_x_range: tuple[float, float] | None = None
 
         # ── Build UI ──────────────────────────────────────────────────────────
+        _Palette.refresh()          # read current system palette before building
         self._build_toolbar()
         self._build_sidebar()
         self._build_central()
+
+        # Re-apply theme when system switches dark ↔ light.
+        QApplication.instance().paletteChanged.connect(self._on_palette_changed)
 
         # ── Timers ────────────────────────────────────────────────────────────
         self._plot_timer = QTimer(self)
@@ -1412,12 +1588,103 @@ class MainWindow(QMainWindow):
         if self._ble and self._live_discovery:
             self._ble.start_scan()
 
+    # ── Theme ──────────────────────────────────────────────────────────────────
+
+    def _on_palette_changed(self) -> None:
+        """Called by Qt when the system switches dark ↔ light mode."""
+        _Palette.refresh()
+        self._apply_theme()
+
+    def _apply_theme(self) -> None:
+        """Re-apply all palette-derived stylesheets after a theme change."""
+        # Toolbar
+        for tb in self.findChildren(QToolBar):
+            tb.setStyleSheet(_Palette.toolbar_style())
+
+        # Live / Fit buttons in toolbar
+        self._live_btn.setStyleSheet(
+            _Palette.active_live_btn() if self._live_btn.isChecked()
+            else _Palette.neutral_btn())
+        self._fit_btn.setStyleSheet(
+            _Palette.active_fit_btn() if self._fit_btn.isChecked()
+            else _Palette.neutral_btn())
+
+        # Record button (preserves text/enabled state — just re-style)
+        if self._rec_ctrl.is_recording:
+            self._record_btn.setStyleSheet(
+                f"QPushButton {{ background:{_Palette.RED}; color:{_Palette.text_on_accent};"
+                f" border:none; border-radius:4px; padding:4px 10px; font-weight:600; }}"
+                f" QPushButton:hover {{ background:{_Palette.RED_DARK}; }}")
+        else:
+            self._record_btn.setStyleSheet(_Palette.neutral_btn())
+
+        # Sensor panel
+        sp = self._sensor_panel
+        if hasattr(sp, '_scan_label'):
+            sp._scan_label.setStyleSheet(_Palette.label_secondary())
+        if hasattr(sp, '_refresh_btn'):
+            sp._refresh_btn.setStyleSheet(_Palette.neutral_btn_small())
+        if hasattr(sp, '_connect_btn'):
+            sp._connect_btn.setStyleSheet(_Palette.neutral_btn_small())
+        if hasattr(sp, '_divider'):
+            sp._divider.setStyleSheet(_Palette.divider_style())
+        # Connected sensor rows
+        for addr, row in sp._sensor_rows.items():
+            lbl = row.findChild(QLabel, f"status_{addr}")
+            btn = row.findChild(QPushButton, f"disc_{addr}")
+            if lbl: lbl.setStyleSheet(_Palette.label_secondary())
+            if btn: btn.setStyleSheet(_Palette.danger_btn_small())
+
+        # Rate panel
+        rp = self._rate_panel
+        if hasattr(rp, '_prev_btn'):
+            rp._prev_btn.setStyleSheet(_Palette.neutral_btn_small())
+            rp._next_btn.setStyleSheet(_Palette.neutral_btn_small())
+            rp._rate_lbl.setStyleSheet(
+                f"font-size:12px; font-weight:600; color:{_Palette.text_primary};")
+
+        # Session panel
+        self._import_btn_style()
+
+        # Sidebar separators — re-create styles by iterating named children
+        for child in self.findChildren(QFrame):
+            if child.frameShape() == QFrame.Shape.HLine:
+                ss = child.styleSheet()
+                if "margin" in ss:
+                    child.setStyleSheet(_Palette.divider_margin())
+                else:
+                    child.setStyleSheet(_Palette.divider_style())
+
+        # Fit panel
+        self._fit_panel._fit_btn.setStyleSheet(
+            self._fit_panel._BTN_NEUTRAL
+            if self._fit_panel._fit_btn.text() == "Fit"
+            else (self._fit_panel._BTN_OK
+                  if "✓" in self._fit_panel._fit_btn.text()
+                  else self._fit_panel._BTN_ERR))
+        self._fit_panel._formula_edit.setStyleSheet(_Palette.input_field())
+        self._fit_panel._status_sep.setStyleSheet(_Palette.divider_style())
+        if self._fit_panel._status_lbl.isVisible():
+            self._fit_panel._status_lbl.setStyleSheet(_Palette.label_error())
+        for row in self._fit_panel._param_rows:
+            for child in row.findChildren(QLabel):
+                if child.styleSheet() == row._val_lbl.styleSheet() or child == row._val_lbl:
+                    child.setStyleSheet(_Palette.label_monospace())
+                else:
+                    child.setStyleSheet(_Palette.label_bold())
+            for child in row.findChildren(QLineEdit):
+                child.setStyleSheet(_Palette.small_field())
+
+    def _import_btn_style(self) -> None:
+        if hasattr(self, '_session_panel'):
+            self._session_panel._import_btn.setStyleSheet(_Palette.neutral_btn_small())
+
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Main toolbar")
         tb.setMovable(False)
-        tb.setStyleSheet("QToolBar { border-bottom: 1px solid #e5e7eb; spacing: 6px; }")
+        tb.setStyleSheet(_Palette.toolbar_style())
         self.addToolBar(tb)
 
         title = QLabel("  Physics Data Recorder")
@@ -1469,22 +1736,10 @@ class MainWindow(QMainWindow):
         tb.addWidget(QWidget())   # right padding
 
     def _live_btn_style(self, active: bool) -> str:
-        if active:
-            return ("QPushButton { border:1px solid #10b981; border-radius:4px;"
-                    " color:#10b981; background:rgba(16,185,129,0.07); padding:4px 10px; }"
-                    " QPushButton:hover { background:rgba(16,185,129,0.15); }")
-        return ("QPushButton { border:1px solid #d1d5db; border-radius:4px;"
-                " color:#9ca3af; background:transparent; padding:4px 10px; }"
-                " QPushButton:hover { background:#f3f4f6; }")
+        return _Palette.active_live_btn() if active else _Palette.neutral_btn()
 
     def _fit_btn_style(self, active: bool) -> str:
-        if active:
-            return ("QPushButton { border:1px solid #8b5cf6; border-radius:4px;"
-                    " color:#8b5cf6; background:rgba(139,92,246,0.07); padding:4px 10px; }"
-                    " QPushButton:hover { background:rgba(139,92,246,0.15); }")
-        return ("QPushButton { border:1px solid #d1d5db; border-radius:4px;"
-                " color:#9ca3af; background:transparent; padding:4px 10px; }"
-                " QPushButton:hover { background:#f3f4f6; }")
+        return _Palette.active_fit_btn() if active else _Palette.neutral_btn()
 
     def _build_sidebar(self) -> None:
         # All sidebar content lives in a scrollable inner widget so that the
@@ -1505,7 +1760,7 @@ class MainWindow(QMainWindow):
         # Rate panel
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.Shape.HLine)
-        sep1.setStyleSheet("color:#e5e7eb; margin:4px 8px;")
+        sep1.setStyleSheet(_Palette.divider_margin())
         v.addWidget(sep1)
 
         self._rate_panel = RatePanel()
@@ -1515,7 +1770,7 @@ class MainWindow(QMainWindow):
         # Divider between panels
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#e5e7eb; margin:4px 8px;")
+        sep.setStyleSheet(_Palette.divider_margin())
         v.addWidget(sep)
 
         # Session panel — no stretch so it takes its natural height and doesn't
@@ -1530,7 +1785,7 @@ class MainWindow(QMainWindow):
         # Fit panel (hidden until fit mode is activated)
         self._fit_sep = QFrame()
         self._fit_sep.setFrameShape(QFrame.Shape.HLine)
-        self._fit_sep.setStyleSheet("color:#e5e7eb; margin:4px 8px;")
+        self._fit_sep.setStyleSheet(_Palette.divider_margin())
         self._fit_sep.hide()
         v.addWidget(self._fit_sep)
 
@@ -1548,7 +1803,7 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFixedWidth(284)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setStyleSheet("QScrollArea { border: none; }")
+        scroll.setStyleSheet(_Palette.scroll_area())
 
         dock = QDockWidget("Sensors & Data", self)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable |
@@ -1680,16 +1935,13 @@ class MainWindow(QMainWindow):
             pts = self._rec_ctrl.total_points()
             self._record_btn.setText(f"■  Stop  ({pts} pts)")
             self._record_btn.setStyleSheet(
-                "QPushButton { background:#ef4444; color:white; border:none;"
-                " border-radius:4px; padding:4px 10px; font-weight:600; }"
-                " QPushButton:hover { background:#dc2626; }")
+                f"QPushButton {{ background:{_Palette.RED}; color:{_Palette.text_on_accent};"
+                f" border:none; border-radius:4px; padding:4px 10px; font-weight:600; }}"
+                f" QPushButton:hover {{ background:{_Palette.RED_DARK}; }}")
             self._record_btn.setEnabled(True)
         else:
             self._record_btn.setText("● Record")
-            self._record_btn.setStyleSheet(
-                "QPushButton { border:1px solid #d1d5db; border-radius:4px;"
-                " padding:4px 10px; }"
-                " QPushButton:hover { background:#f3f4f6; }")
+            self._record_btn.setStyleSheet(_Palette.neutral_btn())
             self._record_btn.setEnabled(any_connected)
 
     def _update_download_btn(self) -> None:
