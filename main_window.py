@@ -1241,6 +1241,11 @@ class ParamSliderRow(QWidget):
         slider_row.setContentsMargins(0, 0, 0, 0)
         slider_row.setSpacing(3)
 
+        self._fix_cb = QCheckBox("fix")
+        self._fix_cb.setToolTip("Fix this parameter during fitting")
+        self._fix_cb.setStyleSheet("font-size:10px;")
+        self._fix_cb.stateChanged.connect(self._on_fix_changed)
+
         self._min_edit = QLineEdit(f"{self._min_val:.3g}")
         self._min_edit.setFixedWidth(52)
         self._min_edit.setStyleSheet(_Palette.small_field())
@@ -1256,6 +1261,7 @@ class ParamSliderRow(QWidget):
         self._max_edit.setStyleSheet(_Palette.small_field())
         self._max_edit.editingFinished.connect(self._on_range_changed)
 
+        slider_row.addWidget(self._fix_cb)
         slider_row.addWidget(self._min_edit)
         slider_row.addWidget(self._slider)
         slider_row.addWidget(self._max_edit)
@@ -1270,7 +1276,17 @@ class ParamSliderRow(QWidget):
     def current_value(self) -> float:
         return self._value
 
+    @property
+    def is_fixed(self) -> bool:
+        return self._fix_cb.isChecked()
+
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _on_fix_changed(self, state: int) -> None:
+        fixed = bool(state)
+        self._slider.setEnabled(not fixed)
+        self._min_edit.setEnabled(not fixed)
+        self._max_edit.setEnabled(not fixed)
 
     def _to_pos(self, v: float) -> int:
         rng = self._max_val - self._min_val
@@ -1374,6 +1390,7 @@ class FitPanel(QWidget):
         self._editing_fit_id: str | None = None
         self._param_rows: list[ParamSliderRow] = []
         self._params_changed_cb = None   # callable(params: dict) | None
+        self._snapshot_fixed: dict[str, float] = {}  # captured at emit time
 
     # ── External API ──────────────────────────────────────────────────────────
 
@@ -1403,7 +1420,14 @@ class FitPanel(QWidget):
         """Set a callable(params: dict) called whenever a slider moves."""
         self._params_changed_cb = cb
 
+    def fixed_params(self) -> dict[str, float]:
+        """Return {name: value} for all parameters whose 'fix' checkbox is checked."""
+        return {row.param_name: row.current_value()
+                for row in self._param_rows if row.is_fixed}
+
     def set_result(self, params: dict, errors: dict) -> None:
+        # Remember which params were fixed so we can restore the checkbox state.
+        previously_fixed = {row.param_name for row in self._param_rows if row.is_fixed}
         self._fit_btn.setText("✓ Fitted")
         self._fit_btn.setStyleSheet(self._BTN_OK)
         self._status_lbl.hide()
@@ -1413,6 +1437,8 @@ class FitPanel(QWidget):
             for name, val in params.items():
                 err = errors.get(name, float('nan'))
                 row = ParamSliderRow(name, val, err)
+                if name in previously_fixed:
+                    row._fix_cb.setChecked(True)   # restore fixed state across re-fits
                 row.value_changed.connect(self._on_param_value_changed)
                 self._layout.addWidget(row)
                 self._param_rows.append(row)
@@ -1487,6 +1513,9 @@ class FitPanel(QWidget):
         if not expr:
             self.set_error("Enter a formula.")
             return
+        # Snapshot fixed params NOW, before any Qt event processing that
+        # could theoretically alter the param rows.
+        self._snapshot_fixed = self.fixed_params()
         self._fit_btn.setText("Fitting…")
         self._fit_btn.setStyleSheet(self._BTN_NEUTRAL)
         source_id, unit = key
@@ -2230,8 +2259,22 @@ class MainWindow(QMainWindow):
             t_sym = Symbol("t")
             expr  = parse_expr(expr_str, transformations=transforms)
             free  = sorted(expr.free_symbols - {t_sym}, key=lambda s: s.name)
-            param_names = [str(s) for s in free]
-            f_np = lambdify([t_sym] + free, expr, "numpy")
+            param_names_all = [str(s) for s in free]   # every symbol in the expr
+            f_np_all = lambdify([t_sym] + free, expr, "numpy")  # full fn for preview
+
+            # Fixed params: use the snapshot captured at button-click time so
+            # the dict cannot be altered by any Qt event processing mid-call.
+            fixed_params = self._fit_panel._snapshot_fixed
+            free_for_fit = [s for s in free if s.name not in fixed_params]
+            param_names = [s.name for s in free_for_fit]    # params to optimise
+            if fixed_params:
+                expr_sub = expr
+                for sym in free:
+                    if sym.name in fixed_params:
+                        expr_sub = expr_sub.subs(sym, fixed_params[sym.name])
+                f_np = lambdify([t_sym] + free_for_fit, expr_sub, "numpy")
+            else:
+                f_np = f_np_all
         except Exception as exc:
             self._fit_panel.set_error(f"Parse error: {exc}")
             return
@@ -2319,15 +2362,24 @@ class MainWindow(QMainWindow):
             popt         = best_popt.tolist()
             params       = dict(zip(param_names, popt))
             param_errors = dict(zip(param_names, perr))
+            # Merge fixed params back in (shown in UI with nan error)
+            for fname, fval in fixed_params.items():
+                params[fname]       = fval
+                param_errors[fname] = float('nan')
         else:
-            # No free parameters — overlay the function as-is.
+            # No free parameters (all may be fixed, or expression has no symbols).
+            params.update(fixed_params)
+            param_errors.update({n: float('nan') for n in fixed_params})
             def fit_fn(t):
                 return _safe_eval(f_np, t)
 
-        # 4. Compute dense fit curve (always an array)
+        # 4. Compute dense fit curve using the full expression (all params).
+        # f_np_all takes all original free symbols in sorted order.
+        popt_all = [params[n] for n in param_names_all] if param_names_all else []
         t_dense = np.linspace(t_min, t_max, 300)
         v_dense = np.asarray(
-            fit_fn(t_dense, *popt) if param_names else fit_fn(t_dense),
+            _safe_eval(f_np_all, t_dense, *popt_all) if param_names_all
+            else _safe_eval(f_np_all, t_dense),
             dtype=float,
         )
 
@@ -2359,12 +2411,16 @@ class MainWindow(QMainWindow):
             on_edit=self._on_edit_fit,
         )
 
-        # Store the fit function so slider changes can update the curve live.
-        if param_names:
-            self._active_fit_fn = fit_fn
+        # Store the full (all-param) fit function so sliders update the curve live.
+        # f_np_all takes all original free symbols; param_names_all is their order.
+        if param_names_all:
+            def _fn_all(t, *args):
+                result = f_np_all(t, *args)
+                return np.broadcast_to(np.asarray(result, dtype=float), np.shape(t)).copy()
+            self._active_fit_fn = _fn_all
         else:
             self._active_fit_fn = None
-        self._active_fit_param_names = param_names
+        self._active_fit_param_names = param_names_all   # includes fixed params
         self._active_fit_id = fit_id
         self._fit_panel.set_params_changed_cb(self._on_fit_params_adjusted)
 
