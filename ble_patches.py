@@ -253,12 +253,12 @@ def _patch_process_measurement_response() -> None:
 
     _orig_pmr = PASCOBLEDevice.process_measurement_response
 
-    def _patched(self, data):
+    def _patched(self, sensor_id, data):
         if data and data[0] <= 0x1F:
             # Push-stream sequence packet: reset ACK counter and discard.
             self._data_ack_counter = 0
             return
-        return _orig_pmr(self, data)
+        return _orig_pmr(self, sensor_id, data)
 
     _patched._pasco_patched_push_drop = True
     PASCOBLEDevice.process_measurement_response = _patched
